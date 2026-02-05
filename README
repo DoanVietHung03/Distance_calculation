@@ -1,36 +1,24 @@
-**Thông số camera iphone 12 thường**
-- Hệ thống camera kép độ phân giải 12MP: Camera Chính và Ultra Wide
-- Camera chính: khẩu độ (độ mở của ống kính → quyết định lượng ánh sáng đi vào cảm biến) ƒ/1.6 và FOV ~75-80°
-- Camera Ultra Wide: khẩu độ ƒ/2.4 và FOV 120°
-- Len 1 và 0.5
+**AI Smart Distance - Đo Khoảng Cách Thực Tế Trên Hình Ảnh**
+- Dự án sử dụng Computer Vision và Deep Learning để ước tính khoảng cách thực tế giữa các đối tượng trên mặt sàn 2D từ camera giám sát. Hệ thống kết hợp kỹ thuật Camera Calibration, Homography Mapping và mô hình YOLOv11 để tự động phát hiện người và đo khoảng cách với độ chính xác cao.
 
-**Yêu cầu cơ bản**
-- Các vật thể cần nhận diện khoảng cách cần phải nằm chung trong 1 mặt phẳng 2D, không được đưa vào yếu tố về chiều cao, chiều sâu.
-- Cần biết chi tiết kích thước thực tế (chiều dài, chiều rộng và độ dài đường chéo của đa giác), càng chính xác thì kết quả trả về có sai số càng bé.
-- Ta cần chấm điểm ROI trên ảnh chính xác nhất có thể với điểm mà ta đã chọn ở ngoài thực tế và đã đo khoảng cách thực tế đó.
-- Do đây là bài toán quy định về 1 mặt phẳng 2D nên yếu tố len của camera không còn quan trọng nữa, có thể bỏ qua trong tính toán.
+1) Tính Năng Chính:
+- Camera Calibration: Khử biến dạng ống kính (Lens Distortion) để đảm bảo hình học chính xác.
+- Object Detection: Tích hợp YOLOv11 (định dạng ONNX/FP16) để tự động phát hiện người trong khung hình.
+- Real-world Mapping: Chuyển đổi tọa độ pixel sang tọa độ thực tế (mét) thông qua ma trận Homography.
+- Smart Selection: Tự động bắt điểm chạm đất (chân) của đối tượng được AI phát hiện. Hỗ trợ vẽ BBox thủ công hoặc chọn điểm bất kỳ trên sàn.
+- Zoom View: Chế độ kính lúp 4x hỗ trợ chọn điểm góc sàn chính xác khi setup.
+- Data Logging: Tự động lưu kết quả đo vào file CSV.
 
-**Test cases**
-1) Khoảng cách ~6m trong văn phòng (chạy 10 lần):
-- chiều rộng từ điểm cửa đến góc nhọn: 1.83m
-- chiều dài từ góc nhọn đến hộp tai nghe: 3.72m
-- chiều rộng từ hộp tai nghe đến chân tủ: 1.28m
-- chiều dài từ chân tủ đến cửa: 4.74m
-- đường chéo cửa đến hộp tai nghe: 4.9m
-- Khoảng cách cần tính: ~2.5m
-- len cam: 1
-    -> Kết quả: trung bình ~2.438m (sai số trung bình dao động trong khoảng +-10cm)
-- len cam: 0.5m
-    -> Kết quả: trung bình ~2.4m (sai số trung bình dao động trong khoảng +-12cm)
-
-2) Khoảng cách ~15m ngoài trời (chạy 10 lần):
-- chiều rộng từ hộp tai nghe đến đuôi xe đen: 3.45m
-- chiều dài từ đuôi xe đen đến bọc nylon: 10.74m
-- chiều rộng từ bọc nylon đến nắp ly nước: 3.2m
-- chiều dài từ nắp ly nước đến hộp tai nghe: 12m
-- đường chéo hộp tai nghe đến bọ nylon: 11.54m
-- Khoảng cách cần tính: ~3.26m
-- len cam: 1
-    -> Kết quả: trung bình ~3.44m (sai số trung bình dao động trong khoảng +-30cm)
-- len cam: 0.5m
-    -> Kết quả: trung bình ~3.38m (sai số trung bình dao động trong khoảng +-40cm)
+2) Phương Pháp & Nguyên Lý Hoạt Động:
+- Quy trình bao gồm 4 bước chính:
+    + Bước 1. Khử Biến Dạng (Undistortion): 
+        - Camera thực tế thường bị méo hình (radial/tangential distortion). Hệ thống sử dụng module calibrate.py để tính toán Camera Matrix (K) và Distortion Coefficients (D) thông qua bàn cờ vua (Chessboard Pattern).
+        - Input: Tập ảnh chụp bàn cờ ở các góc độ khác nhau.
+        - Output: File calibration.json.
+        - Áp dụng: Trước khi đo, ảnh đầu vào sẽ được làm phẳng (undistort) để các đường thẳng trong thực tế cũng là đường thẳng trong ảnh.
+    + Bước 2. Tái Tạo Hình Học Sàn Nhà (Geometry Reconstruction):
+        - Để tính toán ma trận chuyển đổi, hệ thống cần biết hình dạng thực tế của vùng sàn được chọn trên ảnh. Thay vì chỉ nhập kích thước hình chữ nhật đơn giản, thuật toán hỗ trợ tái tạo tứ giác bất kỳ dựa trên độ dài 4 cạnh (L1, L2, L3, L4) và 1 đường chéo (D_{13}).
+        - Thuật toán: Sử dụng Định lý hàm Cos (Law of Cosines) để tìm tọa độ các đỉnh trong không gian 2D thực tế (Metric Space).
+        - Kết quả: Tạo ra tập điểm đích (Destination Points) chính xác theo đơn vị mét.
+    + Bước 3. Phép Chiếu Phối Cảnh (Perspective Transformation):
+        - Sử dụng 4 điểm người dùng chọn trên ảnh (Source Points) và 4 điểm thực tế đã tái tạo ở bước trên (Destination Points) để tính Ma trận Homography (H). Công thức: $P_{real} = H \times P_{pixel}$
