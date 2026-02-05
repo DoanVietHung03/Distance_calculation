@@ -1,0 +1,9 @@
+*.json
+*.mp4
+venv/
+__pycache__/
+.DS_Store
+.idea/
+*.log
+.env
+*.csv
