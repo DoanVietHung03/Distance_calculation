@@ -17,7 +17,7 @@
         - Output: File calibration.json.
         - Áp dụng: Trước khi đo, ảnh đầu vào sẽ được làm phẳng (undistort) để các đường thẳng trong thực tế cũng là đường thẳng trong ảnh.
     + Bước 2. Tái Tạo Hình Học Sàn Nhà (Geometry Reconstruction):
-        - Để tính toán ma trận chuyển đổi, hệ thống cần biết hình dạng thực tế của vùng sàn được chọn trên ảnh. Thay vì chỉ nhập kích thước hình chữ nhật đơn giản, thuật toán hỗ trợ tái tạo tứ giác bất kỳ dựa trên độ dài 4 cạnh (L1, L2, L3, L4) và 1 đường chéo (D_{13}).
+        - Để tính toán ma trận chuyển đổi, hệ thống cần biết hình dạng thực tế của vùng sàn được chọn trên ảnh. Thay vì chỉ nhập kích thước hình chữ nhật đơn giản, thuật toán hỗ trợ tái tạo tứ giác bất kỳ dựa trên độ dài 4 cạnh (L1, L2, L3, L4) và 1 đường chéo (D_13).
         - Thuật toán: Sử dụng Định lý hàm Cos (Law of Cosines) để tìm tọa độ các đỉnh trong không gian 2D thực tế (Metric Space).
         - Kết quả: Tạo ra tập điểm đích (Destination Points) chính xác theo đơn vị mét.
     + Bước 3. Phép Chiếu Phối Cảnh (Perspective Transformation):
