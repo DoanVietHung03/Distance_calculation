@@ -5,6 +5,8 @@ import csv
 import os
 import json
 import time
+from ultralytics import YOLO
+import torch
 
 # ================= CẤU HÌNH HÌNH HỌC SÀN NHÀ =================
 IMAGE_PATH = '.\\test_imgs\\test_5.jpg'       
@@ -34,6 +36,21 @@ class DistanceApp:
         self.clean_frame = None   
         self.orig_resized = None  
         self.last_click_time = 0
+
+        # --- YOLO CONFIG ---
+        self.yolo_model = None
+        self.detected_boxes = [] # Lưu danh sách các box [(x1,y1,x2,y2), ...]
+        
+        self.device = 'cpu'
+        if torch.cuda.is_available():
+            self.device = 0 # 0 nghĩa là GPU đầu tiên (cuda:0)
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"\n[INFO] Đã kích hoạt GPU: {gpu_name}")
+        else:
+            print("\n[WARN] Không tìm thấy GPU NVIDIA. Đang chạy bằng CPU.")
+            
+        self.yolo_model = YOLO('.\\weights\\yolo11n.onnx') 
+        print("Đã load model YOLO11n...")
 
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
         """Thuật toán tái tạo hình học sàn nhà"""
@@ -103,10 +120,8 @@ class DistanceApp:
         ground_y = int(y_max)
         return (ground_x, ground_y), (x_min, y_min, x_max, y_max)
     
-    # Kiểm tra tứ giác lồi
     def check_valid_convex(self, points):
         if len(points) != 4: return False
-        # OpenCV yêu cầu định dạng array shape (N, 1, 2)
         pts_array = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
         return cv2.isContourConvex(pts_array)
 
@@ -136,6 +151,23 @@ class DistanceApp:
             writer.writerow([str(self.clicked_points), str(p_start), str(p_end), round(dist_m, 4)])
             print(f"[CSV] Saved: {dist_m:.2f}m")
 
+    def detect_objects(self):
+        if self.yolo_model is None or self.orig_resized is None: return
+        
+        print("Đang chạy YOLO detect...")
+        # Detect trên ảnh đã resize để tọa độ khớp với màn hình hiển thị
+        results = self.yolo_model(self.orig_resized, classes=[0], verbose=False, device=self.device) # class 0 = person
+        
+        self.detected_boxes = []
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                # Lấy tọa độ x1, y1, x2, y2
+                b = box.xyxy[0].cpu().numpy().astype(int)
+                self.detected_boxes.append(tuple(b))
+        
+        print(f"-> Tìm thấy {len(self.detected_boxes)} người.")
+
 # ================= MAIN LOOP & MOUSE EVENTS =================
 app = DistanceApp()
 
@@ -156,20 +188,15 @@ def mouse_event(event, x, y, flags, param):
                 if len(app.clicked_points) > 1:
                     cv2.line(app.clean_frame, app.clicked_points[-2], (x,y), (0,0,255), 1)
                 
-                # Khi đủ 4 điểm: Kiểm tra và tính toán
                 if len(app.clicked_points) == 4:
                     cv2.line(app.clean_frame, app.clicked_points[3], app.clicked_points[0], (0,0,255), 1)
-                    
-                    # Validate Tứ Giác
                     if app.check_valid_convex(app.clicked_points):
                         app.compute_homography()
                         print("\n>>> SETUP XONG. CHẾ ĐỘ ĐO KÍCH HOẠT <<<")
                     else:
-                        print("\n[CẢNH BÁO] 4 điểm không tạo thành tứ giác lồi (bị chéo hoặc lõm)!")
-                        print(">> Vui lòng Reset (nhấn 'r') và chọn lại theo thứ tự vòng tròn.")
-                        # Xóa kết nối điểm cuối để người dùng nhận ra lỗi
+                        print("\n[CẢNH BÁO] 4 điểm không tạo thành tứ giác lồi!")
                         app.clicked_points = []
-                        app.clean_frame = app.orig_resized.copy() # Reset visual
+                        app.clean_frame = app.orig_resized.copy() 
     else:
         # --- CHẾ ĐỘ ĐO ---
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -182,20 +209,39 @@ def mouse_event(event, x, y, flags, param):
                 drag_dist = math.hypot(x - app.ix, y - app.iy)
                 final_point = None
                 
-                # Kéo > 10px -> BBox
+                # Ưu tiên 1: Nếu KÉO chuột > 10px -> Vẽ BBox thủ công
                 if drag_dist > 10:
                     ground_pt, bbox = app.get_bbox_ground_point((app.ix, app.iy), (x, y))
                     final_point = ground_pt
                     cv2.rectangle(app.clean_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
                     cv2.circle(app.clean_frame, ground_pt, 5, (0, 255, 255), -1)
-                    print(f"-> Đã chọn BBox tại {ground_pt}")
-                # Click -> Point
+                    print(f"-> Manual BBox tại {ground_pt}")
+                
+                # Ưu tiên 2: Nếu CLICK (không kéo) -> Kiểm tra xem có trúng YOLO Box không?
                 else:
-                    final_point = (x, y)
-                    cv2.circle(app.clean_frame, final_point, 5, (255, 0, 255), -1)
-                    cv2.circle(app.clean_frame, final_point, 9, (255, 0, 255), 1)
-                    print(f"-> Đã chấm điểm Point tại {final_point}")
+                    clicked_on_person = False
+                    for (bx1, by1, bx2, by2) in app.detected_boxes:
+                        # Kiểm tra xem điểm click (x,y) có nằm trong box không
+                        if bx1 <= x <= bx2 and by1 <= y <= by2:
+                            # CLICK TRÚNG NGƯỜI -> Tự chọn box đó
+                            ground_pt = ((bx1 + bx2) // 2, by2)
+                            final_point = ground_pt
+                            
+                            # Tô đậm box YOLO đã chọn (Màu xanh lá)
+                            cv2.rectangle(app.clean_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                            cv2.circle(app.clean_frame, ground_pt, 5, (0, 255, 255), -1)
+                            print(f"-> Auto YOLO Select tại {ground_pt}")
+                            clicked_on_person = True
+                            break
+                    
+                    # Ưu tiên 3: Nếu không trúng ai -> Chấm điểm mốc trên sàn
+                    if not clicked_on_person:
+                        final_point = (x, y)
+                        cv2.circle(app.clean_frame, final_point, 5, (255, 0, 255), -1)
+                        cv2.circle(app.clean_frame, final_point, 9, (255, 0, 255), 1)
+                        print(f"-> Point tại {final_point}")
 
+                # Tính toán khoảng cách nếu có điểm mới
                 if final_point:
                     app.measure_points.append(final_point)
                     if len(app.measure_points) >= 2 and len(app.measure_points) % 2 == 0:
@@ -221,11 +267,17 @@ def main():
     
     app.orig_resized = cv2.resize(img_undistorted, (TARGET_W, new_h))
     app.clean_frame = app.orig_resized.copy()
+
+    # --- CHẠY YOLO NGAY KHI KHỞI ĐỘNG ---
+    app.detect_objects()
     
     print(f"Ảnh làm việc: {TARGET_W}x{new_h}")
     print("\n--- HƯỚNG DẪN SỬ DỤNG ---")
-    print("1. SETUP: Click 4 điểm góc sàn.")
-    print("2. ĐO KHOẢNG CÁCH (Kéo BBox hoặc Click điểm).")
+    print("1. SETUP: Click 4 điểm góc sàn (Zoom 4x).")
+    print("2. ĐO KHOẢNG CÁCH (3 Cách):")
+    print("   - Cách 1 (YOLO): Click vào người đã được đóng khung xám.")
+    print("   - Cách 2 (Thủ công): Kéo chuột vẽ hộp quanh người chưa detect.")
+    print("   - Cách 3 (Điểm): Click vào sàn nhà để lấy mốc.")
     print("3. Phím 'r': Reset. Phím 'q': Thoát.")
 
     cv2.namedWindow("Smart Distance")
@@ -234,7 +286,14 @@ def main():
     while True:
         img_show = app.clean_frame.copy()
 
-        # 1. Vẽ BBox Preview (nếu đang kéo chuột)
+        # Vẽ các box YOLO mờ (chưa chọn) để gợi ý người dùng
+        # Chỉ vẽ khi chưa kéo chuột để đỡ rối
+        if not app.drawing:
+            for (x1, y1, x2, y2) in app.detected_boxes:
+                # Vẽ màu xám nhạt (BGR)
+                cv2.rectangle(img_show, (x1, y1), (x2, y2), (100, 100, 100), 1)
+
+        # Vẽ Preview BBox khi kéo chuột
         if app.drawing and app.cur_mouse != (-1, -1):
             drag_dist_preview = math.hypot(app.cur_mouse[0] - app.ix, app.cur_mouse[1] - app.iy)
             if drag_dist_preview > 10:
@@ -242,35 +301,21 @@ def main():
             else:
                 cv2.drawMarker(img_show, app.cur_mouse, (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=10)
         
-        # 2. VẼ KÍNH LÚP (ZOOM WINDOW) KHI SETUP
-        # Chỉ hiện khi chưa tính Homography và chuột đang trong cửa sổ
+        # Vẽ Kính lúp (Zoom Window) khi Setup
         if app.matrix_homography is None and app.cur_mouse != (-1, -1):
             mx, my = app.cur_mouse
-            zoom_factor = 4      # Phóng to 4 lần
-            crop_sz = 40         # Vùng cắt quanh chuột (40x40 px)
-            
-            # Giới hạn vùng cắt không vượt quá ảnh
-            x1 = max(0, mx - crop_sz)
-            y1 = max(0, my - crop_sz)
-            x2 = min(TARGET_W, mx + crop_sz)
-            y2 = min(new_h, my + crop_sz)
+            zoom_factor = 4      
+            crop_sz = 40         
+            x1 = max(0, mx - crop_sz); y1 = max(0, my - crop_sz)
+            x2 = min(TARGET_W, mx + crop_sz); y2 = min(new_h, my + crop_sz)
             
             roi = app.clean_frame[y1:y2, x1:x2]
-            
             if roi.size > 0:
-                # Phóng to ROI (Interpolation Nearest để giữ độ nét pixel)
                 zoomed = cv2.resize(roi, (0,0), fx=zoom_factor, fy=zoom_factor, interpolation=cv2.INTER_NEAREST)
-                
-                # Vẽ tâm chữ thập lên kính lúp
                 zh, zw = zoomed.shape[:2]
                 cv2.line(zoomed, (zw//2, 0), (zw//2, zh), (0, 0, 255), 1)
                 cv2.line(zoomed, (0, zh//2), (zw, zh//2), (0, 0, 255), 1)
-                
-                # Viền cho kính lúp
                 cv2.rectangle(zoomed, (0,0), (zw-1, zh-1), (255, 255, 255), 2)
-                
-                # Dán kính lúp vào góc Phải-Trên (Top-Right) màn hình để không che chuột
-                # (Cách lề 20px)
                 margin = 20
                 if zw < TARGET_W and zh < new_h:
                     img_show[margin:margin+zh, TARGET_W-margin-zw:TARGET_W-margin] = zoomed
@@ -285,6 +330,8 @@ def main():
             app.measure_points = []
             app.matrix_homography = None
             app.clean_frame = app.orig_resized.copy()
+            # Reset thì detect lại lần nữa cho chắc
+            app.detect_objects()
             print("\n--- ĐÃ RESET ---")
 
     cv2.destroyAllWindows()

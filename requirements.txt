@@ -1,0 +1,7 @@
+numpy==2.4.2
+opencv_contrib_python==4.13.0.92
+opencv_python==4.13.0.92
+torch==2.5.1+cu121
+ultralytics==8.4.11
+onnx==1.20.1
+onnxruntime-gpu==1.23.2

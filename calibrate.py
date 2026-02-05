@@ -34,7 +34,7 @@ def main(image_files, fisheye, pattern_size, square_size, threads, json_file=Non
     j['chessboard_spacing_m'] = square_size
         
     # Read first image to get resolution
-    # TODO: use imquery call to retrieve results
+    # use imquery call to retrieve results
     img = cv2.imread(image_files[0], cv2.IMREAD_GRAYSCALE)
     if img is None:
         print('Failed to read %s to get resolution!' % image_files[0])
