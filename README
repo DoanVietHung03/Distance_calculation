@@ -28,12 +28,14 @@
         - Tọa độ chân (ground point) của mỗi người được xác định là trung điểm phía dưới của bounding box do YOLO trả về.
         - Mỗi điểm chân này sau đó được chuyển đổi sang tọa độ thực tế sử dụng ma trận Homography đã tính ở bước 3.
         - Cuối cùng, hệ thống tính toán khoảng cách Euclidean giữa các điểm chân trong không gian thực tế để đưa ra kết quả đo khoảng cách.
+
 3) Lưu Ý Kỹ Thuật:
 - Mô hình YOLOv11 được sử dụng ở định dạng ONNX để tối ưu hiệu năng, đặc biệt khi chạy trên GPU NVIDIA với CUDA.
 - Hệ thống yêu cầu quá trình calibrate kỹ lưỡng để đảm bảo độ chính xác của phép đo.
 - Mặt phẳng giả định: Hệ thống giả định mọi điểm đo đều nằm trên mặt phẳng sàn (Z=0). Việc đo khoảng cách giữa các điểm trên cao (ví dụ: đầu người này sang đầu người kia) sẽ không chính xác về mặt hình học phẳng.
 - Khoảng cách đo được là khoảng cách trên mặt phẳng sàn, không bao gồm chiều cao của đối tượng.
 - Ánh sáng & Góc quay: Độ chính xác của YOLO phụ thuộc vào điều kiện ánh sáng. Độ chính xác của phép đo phụ thuộc vào việc chọn 4 điểm góc sàn có chuẩn xác hay không.
+
 4) Yêu Cầu Hệ Thống:
 - Python 3.12
 - Thư viện: trong file requirements.txt
