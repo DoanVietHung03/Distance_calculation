@@ -9,16 +9,16 @@ from ultralytics import YOLO
 import torch
 
 # ================= CẤU HÌNH HÌNH HỌC SÀN NHÀ =================
-IMAGE_PATH = '.\\test_imgs\\test_5.jpg'       
+IMAGE_PATH = '.\\test_imgs\\cam_2\\cam_2_near.jpg'       
 CALIB_FILE = 'calibration.json' 
 CSV_FILE_NAME = 'measurement_data.csv'
 
 # Kích thước thực tế (Mét)
-L1 = 3.45       # Top
-L2 = 10.74      # Right
-L3 = 3.2        # Bottom
-L4 = 12.0       # Left
-DIAG_13 = 11.54 # Diagonal
+L1 = 4.38       # Top
+L2 = 14.15      # Right
+L3 = 5.7        # Bottom
+L4 = 16.7       # Left
+DIAG_13 = 14.52 # Diagonal
 # ============================================================
 
 class DistanceApp:
@@ -185,6 +185,18 @@ def mouse_event(event, x, y, flags, param):
                 app.clicked_points.append((x, y))
                 cv2.circle(app.clean_frame, (x, y), 5, (0, 0, 255), -1)
                 
+                idx = len(app.clicked_points)  # 1,2,3,4
+                cv2.putText(
+                    app.clean_frame,
+                    str(idx),
+                    (x + 8, y - 8),  # lệch nhẹ cho dễ nhìn
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),  # vàng cho nổi
+                    2,
+                    cv2.LINE_AA
+                )
+                
                 if len(app.clicked_points) > 1:
                     cv2.line(app.clean_frame, app.clicked_points[-2], (x,y), (0,0,255), 1)
                 
@@ -261,7 +273,7 @@ def main():
     if img_undistorted is None: return
 
     h_orig, w_orig = img_undistorted.shape[:2]
-    TARGET_W = 1200 
+    TARGET_W = 1000 
     scale = TARGET_W / w_orig
     new_h = int(h_orig * scale)
     
