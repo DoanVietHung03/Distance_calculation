@@ -34,3 +34,11 @@
     -> Kết quả: trung bình ~3.44m (sai số trung bình dao động trong khoảng +-30cm)
 - len cam: 0.5m
     -> Kết quả: trung bình ~3.38m (sai số trung bình dao động trong khoảng +-40cm)
+
+3) Khoảng cách ~18m ngoai trời (chạy 10 lần):
+- Chiều rộng từ mũ đến cột oto: 4.38m
+- chiều dài từ cột oto đến vạch trắng: 14.15m
+- chiều rộng từ vạch trắng đến cột xe máy: 5.7m
+- chiều dài từ cột xe máy đến mũ: 16.7m
+- đường chéo từ mũ đến vạch trắng: 14.52m
+- Khoảng cách cần tính: ~3.95m
