@@ -1,0 +1,41 @@
+- Dự án sử dụng thuật toán Computer Vision và Deep Learning để ước tính khoảng cách thực tế giữa các đối tượng trên mặt sàn 2D từ camera giám sát. Hệ thống kết hợp kỹ thuật Camera Calibration, Homography Mapping và mô hình YOLOv11 để tự động phát hiện người và đo khoảng cách với độ chính xác cao.
+
+1) Tính Năng Chính:
+- Camera Calibration: Khử biến dạng ống kính (Lens Distortion) để đảm bảo hình học chính xác.
+- Object Detection: Tích hợp YOLOv11 (định dạng ONNX/FP16) để tự động phát hiện người trong khung hình.
+- Real-world Mapping: Chuyển đổi tọa độ pixel sang tọa độ thực tế (mét) thông qua ma trận Homography.
+- Smart Selection: Tự động bắt điểm chạm đất (chân) của đối tượng được AI phát hiện. Hỗ trợ vẽ BBox thủ công hoặc chọn điểm bất kỳ trên sàn.
+- Zoom View: Chế độ kính lúp 4x hỗ trợ chọn điểm góc sàn chính xác khi setup.
+- Data Logging: Tự động lưu kết quả đo vào file CSV.
+
+2) Phương Pháp & Nguyên Lý Hoạt Động:
+- Quy trình bao gồm 4 bước chính:
+    + Bước 1. Khử Biến Dạng (Undistortion): 
+        - Camera thực tế thường bị méo hình (radial/tangential distortion). Hệ thống sử dụng module calibrate.py để tính toán Camera Matrix (K) và Distortion Coefficients (D) thông qua bàn cờ vua (Chessboard Pattern).
+        - Input: Tập ảnh chụp bàn cờ ở các góc độ khác nhau.
+        - Output: File calibration.json.
+        - Áp dụng: Trước khi đo, ảnh đầu vào sẽ được làm phẳng (undistort) để các đường thẳng trong thực tế cũng là đường thẳng trong ảnh.
+    + Bước 2. Tái Tạo Hình Học Sàn Nhà (Geometry Reconstruction):
+        - Để tính toán ma trận chuyển đổi, hệ thống cần biết hình dạng thực tế của vùng sàn được chọn trên ảnh. Thay vì chỉ nhập kích thước hình chữ nhật đơn giản, thuật toán hỗ trợ tái tạo tứ giác bất kỳ dựa trên độ dài 4 cạnh (L1, L2, L3, L4) và 1 đường chéo (D_13).
+        - Thuật toán: Sử dụng Định lý hàm Cos (Law of Cosines) để tìm tọa độ các đỉnh trong không gian 2D thực tế (Metric Space).
+        - Kết quả: Tạo ra tập điểm đích (Destination Points) chính xác theo đơn vị mét.
+    + Bước 3. Phép Chiếu Phối Cảnh (Perspective Transformation):
+        - Sử dụng 4 điểm người dùng chọn trên ảnh (Source Points) và 4 điểm thực tế đã tái tạo ở bước trên (Destination Points) để tính Ma trận Homography (H). Công thức: P_real = H x P_pixel
+        - Ma trận này cho phép ánh xạ bất kỳ điểm pixel (u, v) nào trên mặt sàn trong ảnh sang tọa độ thực tế (X, Y).
+    + Bước 4. Ước Lượng Điểm Chạm Đất (Ground Point Estimation):
+        - Sử dụng mô hình YOLOv11 để phát hiện người trong ảnh. Hệ thống chỉ quan tâm đến class "person".
+        - Tọa độ chân (ground point) của mỗi người được xác định là trung điểm phía dưới của bounding box do YOLO trả về.
+        - Mỗi điểm chân này sau đó được chuyển đổi sang tọa độ thực tế sử dụng ma trận Homography đã tính ở bước 3.
+        - Cuối cùng, hệ thống tính toán khoảng cách Euclidean giữa các điểm chân trong không gian thực tế để đưa ra kết quả đo khoảng cách.
+
+3) Lưu Ý Kỹ Thuật:
+- Mô hình YOLOv11 được sử dụng ở định dạng ONNX để tối ưu hiệu năng, đặc biệt khi chạy trên GPU NVIDIA với CUDA.
+- Hệ thống yêu cầu quá trình calibrate kỹ lưỡng để đảm bảo độ chính xác của phép đo.
+- Mặt phẳng giả định: Hệ thống giả định mọi điểm đo đều nằm trên mặt phẳng sàn (Z=0). Việc đo khoảng cách giữa các điểm trên cao (ví dụ: đầu người này sang đầu người kia) sẽ không chính xác về mặt hình học phẳng.
+- Khoảng cách đo được là khoảng cách trên mặt phẳng sàn, không bao gồm chiều cao của đối tượng.
+- Ánh sáng & Góc quay: Độ chính xác của YOLO phụ thuộc vào điều kiện ánh sáng. Độ chính xác của phép đo phụ thuộc vào việc chọn 4 điểm góc sàn có chuẩn xác hay không.
+
+4) Yêu Cầu Hệ Thống:
+- Python 3.12
+- Thư viện: trong file requirements.txt
+- GPU NVIDIA với CUDA (khuyến nghị) để chạy mô hình YOLO nhanh hơn.
