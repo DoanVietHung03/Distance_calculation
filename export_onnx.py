@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 1. Load model PyTorch gốc
-model = YOLO('.\\weights\\yolo11n.pt')
+model = YOLO('.\\weights\\yolo11n-pose.pt')
 
 # 2. Export sang ONNX
 # format='onnx': Định dạng xuất

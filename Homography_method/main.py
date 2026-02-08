@@ -9,8 +9,8 @@ from ultralytics import YOLO
 import torch
 
 # ================= CẤU HÌNH HÌNH HỌC SÀN NHÀ =================
-IMAGE_PATH = '.\\test_imgs\\cam_2\\cam_2_near.jpg'       
-CALIB_FILE = 'calibration.json' 
+IMAGE_PATH = '..\\test_imgs\\cam_2\\cam_2_near.jpg'       
+CALIB_FILE = '..\\calibration.json' 
 CSV_FILE_NAME = 'measurement_data.csv'
 
 # Kích thước thực tế (Mét)
@@ -39,7 +39,10 @@ class DistanceApp:
 
         # --- YOLO CONFIG ---
         self.yolo_model = None
-        self.detected_boxes = [] # Lưu danh sách các box [(x1,y1,x2,y2), ...]
+        
+        # detected_objects lưu danh sách dict: 
+        # {'box': (x1,y1,x2,y2), 'ground_point': (gx, gy), 'ankles': [(x,y), ...]}
+        self.detected_objects = []
         
         self.device = 'cpu'
         if torch.cuda.is_available():
@@ -49,7 +52,7 @@ class DistanceApp:
         else:
             print("\n[WARN] Không tìm thấy GPU NVIDIA. Đang chạy bằng CPU.")
             
-        self.yolo_model = YOLO('.\\weights\\yolo11n.onnx') 
+        self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
         print("Đã load model YOLO11n...")
 
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
@@ -154,19 +157,76 @@ class DistanceApp:
     def detect_objects(self):
         if self.yolo_model is None or self.orig_resized is None: return
         
-        print("Đang chạy YOLO detect...")
-        # Detect trên ảnh đã resize để tọa độ khớp với màn hình hiển thị
-        results = self.yolo_model(self.orig_resized, classes=[0], verbose=False, device=self.device) # class 0 = person
+        print("Đang chạy YOLO POSE detect...")
+        # Detect
+        results = self.yolo_model(self.orig_resized, verbose=False, device=self.device)
         
-        self.detected_boxes = []
+        self.detected_objects = []
+        
         for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                # Lấy tọa độ x1, y1, x2, y2
-                b = box.xyxy[0].cpu().numpy().astype(int)
-                self.detected_boxes.append(tuple(b))
+            boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+            
+            # Kiểm tra xem model có trả về Keypoints không
+            if r.keypoints is not None and r.keypoints.data is not None:
+                # Shape: (N, 17, 3) -> [x, y, conf]
+                all_keypoints = r.keypoints.data.cpu().numpy()
+            else:
+                all_keypoints = None
+
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = box
+                
+                ground_point = None
+                ankles = []
+                method = "BBOX" # Mặc định
+
+                # --- LOGIC XỬ LÝ POSE ---
+                if all_keypoints is not None and len(all_keypoints) > i:
+                    kpts = all_keypoints[i] # Keypoints của người thứ i
+                    
+                    # Index 15: Left Ankle, 16: Right Ankle
+                    left_ankle = kpts[15]  # [x, y, conf]
+                    right_ankle = kpts[16] # [x, y, conf]
+                    
+                    conf_thresh = 0.5
+                    l_ok = left_ankle[2] > conf_thresh
+                    r_ok = right_ankle[2] > conf_thresh
+                    
+                    if l_ok and r_ok:
+                        # Thấy cả 2 chân -> Lấy trung điểm
+                        gx = int((left_ankle[0] + right_ankle[0]) / 2)
+                        gy = int((left_ankle[1] + right_ankle[1]) / 2)
+                        ground_point = (gx, gy)
+                        ankles = [(int(left_ankle[0]), int(left_ankle[1])), 
+                                  (int(right_ankle[0]), int(right_ankle[1]))]
+                        method = "POSE (2 feet)"
+                        
+                    elif l_ok:
+                        # Chỉ thấy chân trái
+                        ground_point = (int(left_ankle[0]), int(left_ankle[1]))
+                        ankles = [ground_point]
+                        method = "POSE (L foot)"
+                        
+                    elif r_ok:
+                        # Chỉ thấy chân phải
+                        ground_point = (int(right_ankle[0]), int(right_ankle[1]))
+                        ankles = [ground_point]
+                        method = "POSE (R foot)"
+                
+                # --- FALLBACK: Nếu không thấy chân thì dùng BBox ---
+                if ground_point is None:
+                    ground_point = (int((x1 + x2) / 2), int(y2))
+                    method = "BBOX (Fallback)"
+
+                # Lưu thông tin
+                self.detected_objects.append({
+                    'box': (x1, y1, x2, y2),
+                    'ground_point': ground_point,
+                    'ankles': ankles,
+                    'method': method
+                })
         
-        print(f"-> Tìm thấy {len(self.detected_boxes)} người.")
+        print(f"-> Tìm thấy {len(self.detected_objects)} người.")
 
 # ================= MAIN LOOP & MOUSE EVENTS =================
 app = DistanceApp()
@@ -231,26 +291,38 @@ def mouse_event(event, x, y, flags, param):
                 
                 # Ưu tiên 2: Nếu CLICK (không kéo) -> Kiểm tra xem có trúng YOLO Box không?
                 else:
-                    clicked_on_person = False
-                    for (bx1, by1, bx2, by2) in app.detected_boxes:
-                        # Kiểm tra xem điểm click (x,y) có nằm trong box không
+                    clicked_person = None
+                    min_dist = 9999
+                    
+                    # Tìm xem click có nằm trong box ai không
+                    for obj in app.detected_objects:
+                        bx1, by1, bx2, by2 = obj['box']
                         if bx1 <= x <= bx2 and by1 <= y <= by2:
-                            # CLICK TRÚNG NGƯỜI -> Tự chọn box đó
-                            ground_pt = ((bx1 + bx2) // 2, by2)
-                            final_point = ground_pt
-                            
-                            # Tô đậm box YOLO đã chọn (Màu xanh lá)
-                            cv2.rectangle(app.clean_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-                            cv2.circle(app.clean_frame, ground_pt, 5, (0, 255, 255), -1)
-                            print(f"-> Auto YOLO Select tại {ground_pt}")
-                            clicked_on_person = True
+                            # Nếu click trúng nhiều box lồng nhau, chọn box nhỏ nhất hoặc trung tâm nhất
+                            # Ở đây ta lấy người đầu tiên trúng (đơn giản hoá)
+                            clicked_person = obj
                             break
                     
-                    # Ưu tiên 3: Nếu không trúng ai -> Chấm điểm mốc trên sàn
-                    if not clicked_on_person:
+                    if clicked_person:
+                        # Lấy điểm Ground Point XỊN từ Pose
+                        final_point = clicked_person['ground_point']
+                        bx1, by1, bx2, by2 = clicked_person['box']
+                        
+                        # Vẽ UI xác nhận
+                        cv2.rectangle(app.clean_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                        
+                        # Vẽ các điểm ankle cho ngầu
+                        for ank in clicked_person['ankles']:
+                            cv2.circle(app.clean_frame, ank, 4, (0, 0, 255), -1) # Chấm đỏ ở chân
+                            
+                        cv2.circle(app.clean_frame, final_point, 6, (0, 255, 255), -1) # Chấm vàng ở điểm đo
+                        
+                        print(f"-> Auto Select ({clicked_person['method']}) tại {final_point}")
+
+                    # Ưu tiên 3: Nếu không trúng ai -> Chấm điểm sàn
+                    else:
                         final_point = (x, y)
                         cv2.circle(app.clean_frame, final_point, 5, (255, 0, 255), -1)
-                        cv2.circle(app.clean_frame, final_point, 9, (255, 0, 255), 1)
                         print(f"-> Point tại {final_point}")
 
                 # Tính toán khoảng cách nếu có điểm mới
@@ -288,8 +360,7 @@ def main():
     print("1. SETUP: Click 4 điểm góc sàn (Zoom 4x).")
     print("2. ĐO KHOẢNG CÁCH (3 Cách):")
     print("   - Cách 1 (YOLO): Click vào người đã được đóng khung xám.")
-    print("   - Cách 2 (Thủ công): Kéo chuột vẽ hộp quanh người chưa detect.")
-    print("   - Cách 3 (Điểm): Click vào sàn nhà để lấy mốc.")
+    print("   - Cách 2 (Điểm): Click vào sàn nhà để lấy mốc.")
     print("3. Phím 'r': Reset. Phím 'q': Thoát.")
 
     cv2.namedWindow("Smart Distance")
@@ -301,9 +372,20 @@ def main():
         # Vẽ các box YOLO mờ (chưa chọn) để gợi ý người dùng
         # Chỉ vẽ khi chưa kéo chuột để đỡ rối
         if not app.drawing:
-            for (x1, y1, x2, y2) in app.detected_boxes:
-                # Vẽ màu xám nhạt (BGR)
-                cv2.rectangle(img_show, (x1, y1), (x2, y2), (100, 100, 100), 1)
+            for obj in app.detected_objects:
+                bx1, by1, bx2, by2 = obj['box']
+                gx, gy = obj['ground_point']
+                
+                # Vẽ box xám mờ
+                cv2.rectangle(img_show, (bx1, by1), (bx2, by2), (100, 100, 100), 1)
+                
+                # Vẽ điểm chân (Gợi ý màu xanh dương nhạt) để người dùng biết sẽ đo vào đâu
+                cv2.circle(img_show, (gx, gy), 4, (255, 200, 0), -1) 
+                
+                # Vẽ đường nối 2 chân (nếu có)
+                if len(obj['ankles']) == 2:
+                    p1, p2 = obj['ankles']
+                    cv2.line(img_show, p1, p2, (255, 200, 0), 1)
 
         # Vẽ Preview BBox khi kéo chuột
         if app.drawing and app.cur_mouse != (-1, -1):
