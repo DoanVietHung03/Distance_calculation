@@ -42,7 +42,7 @@ class HeightEstimator:
             self.fy = current_width
             return False
 
-    def calculate(self, head_pt, foot_pt, homography_matrix):
+    def calculate(self, head_pt, foot_pt, homography_matrix, cam_real_pos):
         """
         Tính chiều cao thực tế dựa trên công thức Pinhole + Sliding Scale.
         Output: (Chiều cao mét, Khoảng cách tới camera mét)
@@ -59,9 +59,13 @@ class HeightEstimator:
         foot_arr = np.array([[[foot_pt[0], foot_pt[1]]]], dtype=np.float32)
         real_pt = cv2.perspectiveTransform(foot_arr, homography_matrix)[0][0] # (X_real, Y_real)
         
-        # Giả định Camera nằm tại gốc (0,0) hoặc tính khoảng cách từ điểm click đầu tiên
-        # Distance = sqrt(x^2 + y^2)
-        distance_D = math.sqrt(real_pt[0]**2 + real_pt[1]**2)
+        # Tính khoảng cách từ Camera (cam_real_pos) tới điểm chân (real_pt)
+        cam_x, cam_y = cam_real_pos
+        dx = real_pt[0] - cam_x
+        dy = real_pt[1] - cam_y
+        
+        # Khoảng cách thực tế từ ống kính tới vật thể
+        distance_D = math.sqrt(dx**2 + dy**2)
 
         # 3. Áp dụng công thức Sliding Scale: H_real = h_pixel * (D / f)
         # Dùng fy (tiêu cự dọc)

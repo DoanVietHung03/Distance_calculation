@@ -24,7 +24,7 @@ L4 = 16.7       # Left
 DIAG_13 = 14.52 # Diagonal
 
 # Cấu hình Camera ảo
-CAM_REAL_X = 0.0
+CAM_REAL_X = 0.5
 CAM_REAL_Y = -18.0
 # ============================================================
 
@@ -41,7 +41,7 @@ class DistanceApp:
         self.clicked_points = []     
         self.measure_points = []     
         self.matrix_homography = None
-        self.scale_px_per_meter = 100 
+        self.scale_px_per_meter = 1.0 
         
         self.drawing = False
         self.ix, self.iy = -1, -1
@@ -101,6 +101,7 @@ class DistanceApp:
         if not os.path.exists(CALIB_FILE): return img
         try:
             with open(CALIB_FILE, 'r') as f: data = json.load(f)
+            print(f"[OK] Đã load file Calibration: {CALIB_FILE}")
             K = np.array(data['camera_matrix'])
             D = np.array(data['distortion_coefficients'])
             if 'image_resolution' in data: calib_w, calib_h = data['image_resolution']
@@ -171,12 +172,20 @@ class DistanceApp:
 
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = box
+                w_box = x2 - x1
+                h_box = y2 - y1
+                
                 ground_point = None
                 head_point = None 
                 ankles = []
                 method = "BBOX"
+                
+                # --- GIẢI PHÁP 1: XỬ LÝ KHI NGƯỜI Ở XA ---
+                # Nếu chiều cao người < 60 pixel (số này tùy chỉnh theo ảnh thực tế)
+                # Thì bỏ qua Keypoints, dùng luôn BBox cho ổn định
+                IS_FAR_AWAY = h_box < 60
 
-                if all_keypoints is not None and len(all_keypoints) > i:
+                if not IS_FAR_AWAY and all_keypoints is not None and len(all_keypoints) > i:
                     kpts = all_keypoints[i]
                     
                     # 1. TÌM CHÂN 
@@ -204,7 +213,7 @@ class DistanceApp:
                     # 2. TÌM ĐẦU 
                     # Keypoint 0: Mũi (Nose)
                     nose = kpts[0]
-                    if nose[2] > 0.5:
+                    if nose[2] > 0.3:
                         head_point = (int(nose[0]), int(nose[1]))
                     else:
                         # Fallback: Lấy giữa cạnh trên BBox
@@ -213,7 +222,7 @@ class DistanceApp:
                 # Fallback Chân
                 if ground_point is None:
                     ground_point = (int((x1 + x2) / 2), int(y2))
-                    method = "BBOX"
+                    method = "BBOX_FAR" if IS_FAR_AWAY else "BBOX_FALLBACK"
                 
                 # Fallback Đầu (nếu chưa có)
                 if head_point is None:
@@ -309,10 +318,10 @@ def mouse_event(event, x, y, flags, param):
                         if p1[1] > p2[1]: foot, head = p1, p2
                         else: foot, head = p2, p1
                         
-                        h_real, d_real = app.height_tool.calculate(head, foot, app.matrix_homography)
+                        h_real, d_real = app.height_tool.calculate(head, foot, app.matrix_homography, (CAM_REAL_X, CAM_REAL_Y))
                         
                         cv2.line(app.clean_frame, head, foot, (0, 255, 0), 2)
-                        label = f"H: {h_real:.2f}m"
+                        label = f"H: {h_real:.2f}m (D: {d_real:.1f}m)"
                         cv2.putText(app.clean_frame, label, head, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         print(f"[HEIGHT MANUAL] {label}")
                         app.height_clicks = [] # Reset
