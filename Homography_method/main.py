@@ -12,7 +12,7 @@ import torch
 from height_estimator import HeightEstimator
 
 # ================= CẤU HÌNH HÌNH HỌC SÀN NHÀ =================
-IMAGE_PATH = '..\\test_imgs\\cam_1\\cam_1_near.jpg'       
+IMAGE_PATH = '..\\test_imgs\\cam_2\\cam_2.jpg'       
 CALIB_FILE = '..\\calibration.json' 
 CSV_FILE_NAME = 'measurement_data.csv'
 
@@ -245,7 +245,7 @@ def mouse_event(event, x, y, flags, param):
         app.cur_mouse = (x, y)
 
     if app.matrix_homography is None:
-        # --- CHẾ ĐỘ SETUP (GIỮ NGUYÊN) ---
+        # --- CHẾ ĐỘ SETUP ---
         if event == cv2.EVENT_LBUTTONDOWN:
             if time.time() - app.last_click_time < 0.3: return 
             app.last_click_time = time.time()
@@ -254,6 +254,7 @@ def mouse_event(event, x, y, flags, param):
                 cv2.circle(app.clean_frame, (x, y), 5, (0, 0, 255), -1)
                 idx = len(app.clicked_points)
                 cv2.putText(app.clean_frame, str(idx), (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                print(f"[SETUP] Click {idx}: ({x}, {y})")
                 if len(app.clicked_points) > 1:
                     cv2.line(app.clean_frame, app.clicked_points[-2], (x,y), (0,0,255), 1)
                 if len(app.clicked_points) == 4:
@@ -277,7 +278,7 @@ def mouse_event(event, x, y, flags, param):
                     clicked_person = obj
                     break
 
-            # === LOGIC 1: ĐO KHOẢNG CÁCH SÀN (CŨ) ===
+            # === LOGIC 1: ĐO KHOẢNG CÁCH SÀN ===
             if app.mode == "DISTANCE":
                 # Logic cũ của bạn (đã được giữ nguyên)
                 if not app.drawing: # Bắt đầu vẽ box tay nếu cần
