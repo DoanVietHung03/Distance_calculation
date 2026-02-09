@@ -8,8 +8,11 @@ import time
 from ultralytics import YOLO
 import torch
 
+# IMPORT MODULE MỚI
+from height_estimator import HeightEstimator
+
 # ================= CẤU HÌNH HÌNH HỌC SÀN NHÀ =================
-IMAGE_PATH = '..\\test_imgs\\cam_2\\cam_2_near.jpg'       
+IMAGE_PATH = '..\\test_imgs\\cam_1\\cam_1_near.jpg'       
 CALIB_FILE = '..\\calibration.json' 
 CSV_FILE_NAME = 'measurement_data.csv'
 
@@ -19,16 +22,27 @@ L2 = 14.15      # Right
 L3 = 5.7        # Bottom
 L4 = 16.7       # Left
 DIAG_13 = 14.52 # Diagonal
+
+# Cấu hình Camera ảo
+CAM_REAL_X = 0.0
+CAM_REAL_Y = -18.0
 # ============================================================
 
 class DistanceApp:
     def __init__(self):
+        # --- CẤU HÌNH: CHẾ ĐỘ ĐO ---
+        self.mode = "DISTANCE" # Có 2 chế độ: "DISTANCE" hoặc "HEIGHT"
+        self.height_clicks = [] # Lưu tạm điểm click manual cho chiều cao
+        
+        # Khởi tạo công cụ tính chiều cao
+        self.height_tool = HeightEstimator()
+
+        # --- CẤU HÌNH CHẾ ĐỘ ---
         self.clicked_points = []     
         self.measure_points = []     
         self.matrix_homography = None
         self.scale_px_per_meter = 100 
         
-        # Trạng thái chuột
         self.drawing = False
         self.ix, self.iy = -1, -1
         self.cur_mouse = (-1, -1) 
@@ -37,62 +51,54 @@ class DistanceApp:
         self.orig_resized = None  
         self.last_click_time = 0
 
-        # --- YOLO CONFIG ---
         self.yolo_model = None
-        
-        # detected_objects lưu danh sách dict: 
-        # {'box': (x1,y1,x2,y2), 'ground_point': (gx, gy), 'ankles': [(x,y), ...]}
+        # detected_objects cập nhật thêm field 'head_point'
         self.detected_objects = []
         
         self.device = 'cpu'
         if torch.cuda.is_available():
-            self.device = 0 # 0 nghĩa là GPU đầu tiên (cuda:0)
+            self.device = 0
             gpu_name = torch.cuda.get_device_name(0)
             print(f"\n[INFO] Đã kích hoạt GPU: {gpu_name}")
         else:
             print("\n[WARN] Không tìm thấy GPU NVIDIA. Đang chạy bằng CPU.")
             
-        self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
-        print("Đã load model YOLO11n...")
+        try:
+            self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
+            print("Đã load model YOLO11n...")
+        except:
+            print("[ERR] Không tìm thấy model weights!")
 
+    # --- CÁC HÀM HỖ TRỢ KHÁC ---
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
-        """Thuật toán tái tạo hình học sàn nhà"""
         if l1 + l2 < d13 or abs(l1 - l2) > d13:
-            print("[ERR] Số liệu sai: L1, L2 và Đường chéo không tạo thành tam giác!")
+            print("[ERR] Số liệu sai hình học!")
             return []
-        
         p1 = (0.0, 0.0)
         p2 = (l1, 0.0)
-        
         cos_alpha = (l1**2 + d13**2 - l2**2) / (2 * l1 * d13)
         cos_alpha = max(-1.0, min(1.0, cos_alpha))
         alpha = math.acos(cos_alpha)
         p3 = (d13 * math.cos(alpha), d13 * math.sin(alpha))
-        
         d = d13
         a = (l4**2 - l3**2 + d**2) / (2*d)
         val_sqrt = l4**2 - a**2
         h = math.sqrt(max(0, val_sqrt))
-        
         x0 = p1[0] + a * (p3[0] - p1[0]) / d
         y0 = p1[1] + a * (p3[1] - p1[1]) / d
         rx = -(p3[1] - p1[1]) / d
         ry = (p3[0] - p1[0]) / d
-        
         p4_a = (x0 + h * rx, y0 + h * ry)
         p4_b = (x0 - h * rx, y0 - h * ry)
-        
         def cross_product(vx, vy, px, py): return vx * py - vy * px
         if cross_product(p3[0], p3[1], p4_a[0], p4_a[1]) > 0: p4 = p4_a
         else: p4 = p4_b
-
         return [p1, p2, p3, p4]
 
     def load_calibration_and_undistort(self, img_path):
         img = cv2.imread(img_path)
         if img is None: return None
         if not os.path.exists(CALIB_FILE): return img
-
         try:
             with open(CALIB_FILE, 'r') as f: data = json.load(f)
             K = np.array(data['camera_matrix'])
@@ -100,11 +106,9 @@ class DistanceApp:
             if 'image_resolution' in data: calib_w, calib_h = data['image_resolution']
             else: calib_w, calib_h = 810, 720
             h_curr, w_curr = img.shape[:2]
-
             if w_curr != calib_w or h_curr != calib_h:
                 scale_x = w_curr / calib_w; scale_y = h_curr / calib_h
                 K[0, 0] *= scale_x; K[1, 1] *= scale_y; K[0, 2] *= scale_x; K[1, 2] *= scale_y
-
             new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, (w_curr, h_curr), 1, (w_curr, h_curr))
             map1, map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, (w_curr, h_curr), 5)
             undistorted = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
@@ -114,7 +118,6 @@ class DistanceApp:
             return img
 
     def get_bbox_ground_point(self, p1, p2):
-        """Tính điểm chân từ BBox"""
         x1, y1 = p1
         x2, y2 = p2
         x_min, x_max = min(x1, x2), max(x1, x2)
@@ -132,7 +135,6 @@ class DistanceApp:
         if len(self.clicked_points) < 4: return
         real_coords = self.get_quadrilateral_coords(L1, L2, L3, L4, DIAG_13)
         if not real_coords: return
-
         dst_pts = np.float32([[pt[0] * self.scale_px_per_meter, pt[1] * self.scale_px_per_meter] for pt in real_coords])
         src_pts = np.float32(self.clicked_points)
         self.matrix_homography = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -156,76 +158,74 @@ class DistanceApp:
 
     def detect_objects(self):
         if self.yolo_model is None or self.orig_resized is None: return
-        
         print("Đang chạy YOLO POSE detect...")
-        # Detect
         results = self.yolo_model(self.orig_resized, verbose=False, device=self.device)
-        
         self.detected_objects = []
         
         for r in results:
             boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-            
-            # Kiểm tra xem model có trả về Keypoints không
             if r.keypoints is not None and r.keypoints.data is not None:
-                # Shape: (N, 17, 3) -> [x, y, conf]
                 all_keypoints = r.keypoints.data.cpu().numpy()
             else:
                 all_keypoints = None
 
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = box
-                
                 ground_point = None
+                head_point = None 
                 ankles = []
-                method = "BBOX" # Mặc định
+                method = "BBOX"
 
-                # --- LOGIC XỬ LÝ POSE ---
                 if all_keypoints is not None and len(all_keypoints) > i:
-                    kpts = all_keypoints[i] # Keypoints của người thứ i
+                    kpts = all_keypoints[i]
                     
-                    # Index 15: Left Ankle, 16: Right Ankle
-                    left_ankle = kpts[15]  # [x, y, conf]
-                    right_ankle = kpts[16] # [x, y, conf]
-                    
-                    conf_thresh = 0.5
-                    l_ok = left_ankle[2] > conf_thresh
-                    r_ok = right_ankle[2] > conf_thresh
+                    # 1. TÌM CHÂN 
+                    left_ankle = kpts[15]
+                    right_ankle = kpts[16]
+                    l_ok = left_ankle[2] > 0.5
+                    r_ok = right_ankle[2] > 0.5
                     
                     if l_ok and r_ok:
-                        # Thấy cả 2 chân -> Lấy trung điểm
                         gx = int((left_ankle[0] + right_ankle[0]) / 2)
                         gy = int((left_ankle[1] + right_ankle[1]) / 2)
                         ground_point = (gx, gy)
                         ankles = [(int(left_ankle[0]), int(left_ankle[1])), 
                                   (int(right_ankle[0]), int(right_ankle[1]))]
-                        method = "POSE (2 feet)"
-                        
+                        method = "POSE"
                     elif l_ok:
-                        # Chỉ thấy chân trái
                         ground_point = (int(left_ankle[0]), int(left_ankle[1]))
                         ankles = [ground_point]
-                        method = "POSE (L foot)"
-                        
+                        method = "POSE"
                     elif r_ok:
-                        # Chỉ thấy chân phải
                         ground_point = (int(right_ankle[0]), int(right_ankle[1]))
                         ankles = [ground_point]
-                        method = "POSE (R foot)"
-                
-                # --- FALLBACK: Nếu không thấy chân thì dùng BBox ---
+                        method = "POSE"
+
+                    # 2. TÌM ĐẦU 
+                    # Keypoint 0: Mũi (Nose)
+                    nose = kpts[0]
+                    if nose[2] > 0.5:
+                        head_point = (int(nose[0]), int(nose[1]))
+                    else:
+                        # Fallback: Lấy giữa cạnh trên BBox
+                        head_point = (int((x1 + x2) / 2), y1)
+
+                # Fallback Chân
                 if ground_point is None:
                     ground_point = (int((x1 + x2) / 2), int(y2))
-                    method = "BBOX (Fallback)"
+                    method = "BBOX"
+                
+                # Fallback Đầu (nếu chưa có)
+                if head_point is None:
+                    head_point = (int((x1 + x2) / 2), y1)
 
-                # Lưu thông tin
                 self.detected_objects.append({
                     'box': (x1, y1, x2, y2),
                     'ground_point': ground_point,
+                    'head_point': head_point, 
                     'ankles': ankles,
                     'method': method
                 })
-        
         print(f"-> Tìm thấy {len(self.detected_objects)} người.")
 
 # ================= MAIN LOOP & MOUSE EVENTS =================
@@ -236,108 +236,126 @@ def mouse_event(event, x, y, flags, param):
         app.cur_mouse = (x, y)
 
     if app.matrix_homography is None:
-        # --- CHẾ ĐỘ SETUP ---
+        # --- CHẾ ĐỘ SETUP (GIỮ NGUYÊN) ---
         if event == cv2.EVENT_LBUTTONDOWN:
             if time.time() - app.last_click_time < 0.3: return 
             app.last_click_time = time.time()
-            
             if len(app.clicked_points) < 4:
                 app.clicked_points.append((x, y))
                 cv2.circle(app.clean_frame, (x, y), 5, (0, 0, 255), -1)
-                
-                idx = len(app.clicked_points)  # 1,2,3,4
-                cv2.putText(
-                    app.clean_frame,
-                    str(idx),
-                    (x + 8, y - 8),  # lệch nhẹ cho dễ nhìn
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),  # vàng cho nổi
-                    2,
-                    cv2.LINE_AA
-                )
-                
+                idx = len(app.clicked_points)
+                cv2.putText(app.clean_frame, str(idx), (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 if len(app.clicked_points) > 1:
                     cv2.line(app.clean_frame, app.clicked_points[-2], (x,y), (0,0,255), 1)
-                
                 if len(app.clicked_points) == 4:
                     cv2.line(app.clean_frame, app.clicked_points[3], app.clicked_points[0], (0,0,255), 1)
                     if app.check_valid_convex(app.clicked_points):
                         app.compute_homography()
-                        print("\n>>> SETUP XONG. CHẾ ĐỘ ĐO KÍCH HOẠT <<<")
+                        print("\n>>> SETUP XONG. SẴN SÀNG ĐO <<<")
                     else:
-                        print("\n[CẢNH BÁO] 4 điểm không tạo thành tứ giác lồi!")
+                        print("\n[WARN] Setup sai. Reset.")
                         app.clicked_points = []
                         app.clean_frame = app.orig_resized.copy() 
     else:
-        # --- CHẾ ĐỘ ĐO ---
+        # --- CHẾ ĐỘ ĐO ĐẠC ---
         if event == cv2.EVENT_LBUTTONDOWN:
-            app.drawing = True
-            app.ix, app.iy = x, y
+            
+            # Kiểm tra xem có click vào người nào không?
+            clicked_person = None
+            for obj in app.detected_objects:
+                bx1, by1, bx2, by2 = obj['box']
+                if bx1 <= x <= bx2 and by1 <= y <= by2:
+                    clicked_person = obj
+                    break
+
+            # === LOGIC 1: ĐO KHOẢNG CÁCH SÀN (CŨ) ===
+            if app.mode == "DISTANCE":
+                # Logic cũ của bạn (đã được giữ nguyên)
+                if not app.drawing: # Bắt đầu vẽ box tay nếu cần
+                    app.drawing = True
+                    app.ix, app.iy = x, y
+                
+                # Logic xử lý click đơn (không kéo)
+                # ... (Phần xử lý MouseUp bên dưới sẽ lo việc này)
+
+            # === LOGIC 2: ĐO CHIỀU CAO (MỚI) ===
+            elif app.mode == "HEIGHT":
+                if clicked_person:
+                    # AUTO: Nếu click vào người -> Đo luôn từ Đầu đến Chân
+                    head = clicked_person['head_point']
+                    foot = clicked_person['ground_point']
+                    
+                    h_real, d_real = app.height_tool.calculate(head, foot, app.matrix_homography)
+                    
+                    # Vẽ kết quả lên màn hình
+                    cv2.line(app.clean_frame, head, foot, (0, 255, 0), 2)
+                    cv2.circle(app.clean_frame, head, 4, (0, 0, 255), -1)
+                    cv2.circle(app.clean_frame, foot, 4, (0, 255, 255), -1)
+                    
+                    label = f"H: {h_real:.2f}m (D: {d_real:.1f}m)"
+                    cv2.putText(app.clean_frame, label, (head[0], head[1]-15), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    print(f"[HEIGHT] {label}")
+                
+                else:
+                    # MANUAL: Click 2 điểm bất kỳ (Chân -> Đầu)
+                    app.height_clicks.append((x,y))
+                    cv2.circle(app.clean_frame, (x,y), 4, (0, 255, 0), -1)
+                    
+                    if len(app.height_clicks) == 2:
+                        p1, p2 = app.height_clicks[-2], app.height_clicks[-1]
+                        
+                        # Xác định đâu là chân (y lớn hơn), đâu là đầu (y nhỏ hơn)
+                        if p1[1] > p2[1]: foot, head = p1, p2
+                        else: foot, head = p2, p1
+                        
+                        h_real, d_real = app.height_tool.calculate(head, foot, app.matrix_homography)
+                        
+                        cv2.line(app.clean_frame, head, foot, (0, 255, 0), 2)
+                        label = f"H: {h_real:.2f}m"
+                        cv2.putText(app.clean_frame, label, head, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        print(f"[HEIGHT MANUAL] {label}")
+                        app.height_clicks = [] # Reset
 
         elif event == cv2.EVENT_LBUTTONUP:
-            if app.drawing: 
+            # Logic cho Distance mode (Kéo thả, chọn BBox...)
+            if app.mode == "DISTANCE" and app.drawing:
                 app.drawing = False
                 drag_dist = math.hypot(x - app.ix, y - app.iy)
                 final_point = None
                 
-                # Ưu tiên 1: Nếu KÉO chuột > 10px -> Vẽ BBox thủ công
-                if drag_dist > 10:
+                if drag_dist > 10: # Kéo vẽ box
                     ground_pt, bbox = app.get_bbox_ground_point((app.ix, app.iy), (x, y))
                     final_point = ground_pt
                     cv2.rectangle(app.clean_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
                     cv2.circle(app.clean_frame, ground_pt, 5, (0, 255, 255), -1)
-                    print(f"-> Manual BBox tại {ground_pt}")
-                
-                # Ưu tiên 2: Nếu CLICK (không kéo) -> Kiểm tra xem có trúng YOLO Box không?
-                else:
+                else: # Click đơn
                     clicked_person = None
-                    min_dist = 9999
-                    
-                    # Tìm xem click có nằm trong box ai không
                     for obj in app.detected_objects:
                         bx1, by1, bx2, by2 = obj['box']
                         if bx1 <= x <= bx2 and by1 <= y <= by2:
-                            # Nếu click trúng nhiều box lồng nhau, chọn box nhỏ nhất hoặc trung tâm nhất
-                            # Ở đây ta lấy người đầu tiên trúng (đơn giản hoá)
                             clicked_person = obj
                             break
                     
                     if clicked_person:
-                        # Lấy điểm Ground Point XỊN từ Pose
                         final_point = clicked_person['ground_point']
-                        bx1, by1, bx2, by2 = clicked_person['box']
-                        
-                        # Vẽ UI xác nhận
-                        cv2.rectangle(app.clean_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-                        
-                        # Vẽ các điểm ankle cho ngầu
+                        # Vẽ minh họa
                         for ank in clicked_person['ankles']:
-                            cv2.circle(app.clean_frame, ank, 4, (0, 0, 255), -1) # Chấm đỏ ở chân
-                            
-                        cv2.circle(app.clean_frame, final_point, 6, (0, 255, 255), -1) # Chấm vàng ở điểm đo
-                        
-                        print(f"-> Auto Select ({clicked_person['method']}) tại {final_point}")
-
-                    # Ưu tiên 3: Nếu không trúng ai -> Chấm điểm sàn
+                             cv2.circle(app.clean_frame, ank, 4, (0, 0, 255), -1)
+                        cv2.circle(app.clean_frame, final_point, 6, (0, 255, 255), -1)
                     else:
                         final_point = (x, y)
                         cv2.circle(app.clean_frame, final_point, 5, (255, 0, 255), -1)
-                        print(f"-> Point tại {final_point}")
 
-                # Tính toán khoảng cách nếu có điểm mới
                 if final_point:
                     app.measure_points.append(final_point)
                     if len(app.measure_points) >= 2 and len(app.measure_points) % 2 == 0:
                         p_start = app.measure_points[-2]
                         p_end = app.measure_points[-1]
                         dist = app.calculate_distance_real(p_start, p_end)
-                        
                         cv2.line(app.clean_frame, p_start, p_end, (0, 165, 255), 2)
-                        mid_x = (p_start[0] + p_end[0]) // 2
-                        mid_y = (p_start[1] + p_end[1]) // 2
-                        cv2.putText(app.clean_frame, f"{dist:.2f}m", (mid_x, mid_y - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
+                        mid = ((p_start[0]+p_end[0])//2, (p_start[1]+p_end[1])//2)
+                        cv2.putText(app.clean_frame, f"{dist:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                         app.save_csv(p_start, p_end, dist)
 
 def main():
@@ -345,23 +363,27 @@ def main():
     if img_undistorted is None: return
 
     h_orig, w_orig = img_undistorted.shape[:2]
-    TARGET_W = 1000 
+    TARGET_W = 1200 
     scale = TARGET_W / w_orig
     new_h = int(h_orig * scale)
     
     app.orig_resized = cv2.resize(img_undistorted, (TARGET_W, new_h))
     app.clean_frame = app.orig_resized.copy()
 
-    # --- CHẠY YOLO NGAY KHI KHỞI ĐỘNG ---
+    # --- SETUP HEIGHT ESTIMATOR ---
+    # Cập nhật focal length theo kích thước ảnh mới resize
+    app.height_tool.load_focal_length(CALIB_FILE, TARGET_W)
+
     app.detect_objects()
     
     print(f"Ảnh làm việc: {TARGET_W}x{new_h}")
     print("\n--- HƯỚNG DẪN SỬ DỤNG ---")
-    print("1. SETUP: Click 4 điểm góc sàn (Zoom 4x).")
-    print("2. ĐO KHOẢNG CÁCH (3 Cách):")
-    print("   - Cách 1 (YOLO): Click vào người đã được đóng khung xám.")
-    print("   - Cách 2 (Điểm): Click vào sàn nhà để lấy mốc.")
-    print("3. Phím 'r': Reset. Phím 'q': Thoát.")
+    print("1. SETUP: Click 4 điểm góc sàn.")
+    print("2. Phím 'd': Chế độ ĐO KHOẢNG CÁCH SÀN.")
+    print("3. Phím 'h': Chế độ ĐO CHIỀU CAO.")
+    print("   - Auto: Click vào người.")
+    print("   - Manual: Click Chân -> Click Đầu.")
+    print("4. 'r': Reset, 'q': Thoát.")
 
     cv2.namedWindow("Smart Distance")
     cv2.setMouseCallback("Smart Distance", mouse_event)
@@ -369,8 +391,10 @@ def main():
     while True:
         img_show = app.clean_frame.copy()
 
-        # Vẽ các box YOLO mờ (chưa chọn) để gợi ý người dùng
-        # Chỉ vẽ khi chưa kéo chuột để đỡ rối
+        # Hiển thị chế độ hiện tại
+        mode_color = (0, 165, 255) if app.mode == "DISTANCE" else (0, 255, 0)
+        cv2.putText(img_show, f"MODE: {app.mode}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, mode_color, 2)
+
         if not app.drawing:
             for obj in app.detected_objects:
                 bx1, by1, bx2, by2 = obj['box']
@@ -379,54 +403,51 @@ def main():
                 # Vẽ box xám mờ
                 cv2.rectangle(img_show, (bx1, by1), (bx2, by2), (100, 100, 100), 1)
                 
-                # Vẽ điểm chân (Gợi ý màu xanh dương nhạt) để người dùng biết sẽ đo vào đâu
-                cv2.circle(img_show, (gx, gy), 4, (255, 200, 0), -1) 
+                if app.mode == "DISTANCE":
+                    # Gợi ý điểm chân
+                    cv2.circle(img_show, (gx, gy), 4, (255, 200, 0), -1) 
                 
-                # Vẽ đường nối 2 chân (nếu có)
-                if len(obj['ankles']) == 2:
-                    p1, p2 = obj['ankles']
-                    cv2.line(img_show, p1, p2, (255, 200, 0), 1)
+                elif app.mode == "HEIGHT":
+                    # Gợi ý đường cao (Đầu -> Chân)
+                    head = obj['head_point']
+                    cv2.line(img_show, head, (gx, gy), (100, 100, 100), 1)
+                    cv2.circle(img_show, head, 3, (0, 255, 0), -1)
 
-        # Vẽ Preview BBox khi kéo chuột
-        if app.drawing and app.cur_mouse != (-1, -1):
-            drag_dist_preview = math.hypot(app.cur_mouse[0] - app.ix, app.cur_mouse[1] - app.iy)
-            if drag_dist_preview > 10:
-                cv2.rectangle(img_show, (app.ix, app.iy), app.cur_mouse, (0, 255, 0), 2)
-            else:
-                cv2.drawMarker(img_show, app.cur_mouse, (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=10)
-        
-        # Vẽ Kính lúp (Zoom Window) khi Setup
+        # Draw Zoom window & Preview
         if app.matrix_homography is None and app.cur_mouse != (-1, -1):
             mx, my = app.cur_mouse
             zoom_factor = 4      
             crop_sz = 40         
             x1 = max(0, mx - crop_sz); y1 = max(0, my - crop_sz)
             x2 = min(TARGET_W, mx + crop_sz); y2 = min(new_h, my + crop_sz)
-            
             roi = app.clean_frame[y1:y2, x1:x2]
             if roi.size > 0:
                 zoomed = cv2.resize(roi, (0,0), fx=zoom_factor, fy=zoom_factor, interpolation=cv2.INTER_NEAREST)
                 zh, zw = zoomed.shape[:2]
-                cv2.line(zoomed, (zw//2, 0), (zw//2, zh), (0, 0, 255), 1)
-                cv2.line(zoomed, (0, zh//2), (zw, zh//2), (0, 0, 255), 1)
                 cv2.rectangle(zoomed, (0,0), (zw-1, zh-1), (255, 255, 255), 2)
+                cv2.line(zoomed, (zw//2, 0), (zw//2, zh), (0,0,255), 1)
+                cv2.line(zoomed, (0, zh//2), (zw, zh//2), (0,0,255), 1)
                 margin = 20
                 if zw < TARGET_W and zh < new_h:
                     img_show[margin:margin+zh, TARGET_W-margin-zw:TARGET_W-margin] = zoomed
-                    cv2.putText(img_show, "ZOOM 4x", (TARGET_W-margin-zw, margin-5), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         cv2.imshow("Smart Distance", img_show)
         key = cv2.waitKey(1)
         if key == ord('q'): break
+        
+        # --- LOGIC CHUYỂN CHẾ ĐỘ ---
+        if key == ord('d'): app.mode = "DISTANCE"
+        if key == ord('h'): 
+            app.mode = "HEIGHT"
+            app.height_clicks = []
+            
         if key == ord('r'):
             app.clicked_points = []
             app.measure_points = []
             app.matrix_homography = None
             app.clean_frame = app.orig_resized.copy()
-            # Reset thì detect lại lần nữa cho chắc
             app.detect_objects()
-            print("\n--- ĐÃ RESET ---")
+            print("--- RESET ---")
 
     cv2.destroyAllWindows()
 
