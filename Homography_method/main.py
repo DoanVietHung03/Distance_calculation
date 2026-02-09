@@ -321,7 +321,7 @@ def mouse_event(event, x, y, flags, param):
                         h_real, d_real = app.height_tool.calculate(head, foot, app.matrix_homography, app.cam_real_pos)
                         
                         cv2.line(app.clean_frame, head, foot, (0, 255, 0), 2)
-                        label = f"H: {h_real:.2f}m (D: {d_real:.1f}m)"
+                        label = f"H: {h_real:.2f}m (D from cam: {d_real:.1f}m)"
                         cv2.putText(app.clean_frame, label, head, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         print(f"[HEIGHT MANUAL] {label}")
                         app.height_clicks = [] 
