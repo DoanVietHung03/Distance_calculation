@@ -41,11 +41,10 @@
 - điểm 3 -> 4: 5.49m
 - điểm 4 -> 1: 11.41m
 - điểm 1 -> 3: 9.54m
-- camera -> 1: 14.71m
+- camera -> 1: 15.1m
 - độ cao của camera so với mặt đất: 
 - khoảng cách để test (người -> nón):
-    + điểm 1: 1.49m
-    + điểm 2: 4.58m
-    + điểm 3: 4.39m
-    + điểm 4: 2.75m
-    + điểm 5: 3.93m
+    + điểm 1: 2.55m
+    + điểm 2: 2.7m
+    + điểm 3: 2.76m
+    + điểm 4: 2.79m

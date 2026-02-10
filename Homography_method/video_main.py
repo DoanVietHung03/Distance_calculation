@@ -18,7 +18,7 @@ except ImportError:
     ROIStabilizer = None
 
 # ================= CẤU HÌNH =================
-VIDEO_PATH = '..\\test_imgs\\cam_2\\test.mp4' 
+VIDEO_PATH = '..\\test_imgs\\cam_2\\cam_2.mp4' 
 CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200  # Resize về kích thước này để xử lý cho nhanh
