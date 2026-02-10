@@ -3,9 +3,9 @@ import numpy as np
 import math
 import os
 import json
+import time
 from ultralytics import YOLO
 import torch
-import time
 
 # IMPORT MODULE CŨ
 from height_estimator import HeightEstimator
@@ -15,28 +15,37 @@ VIDEO_PATH = '..\\test_imgs\\cam_2\\cam_2.mp4'
 CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200 
+YOLO_SKIP_FRAMES = 3  # Giảm xuống 3 để mượt hơn chút
 
 class VideoDistanceApp:
     def __init__(self):
-        # --- CẤU HÌNH MODE ---
         self.mode = "DISTANCE"
         self.paused = False
+        self.frame_count = 0
         
-        # --- TRACKING ---
-        self.target_tracker = None      # Tracker cho điểm đích (Target)
-        self.roi_trackers = []          # List 4 Tracker cho 4 góc ROI
-        self.roi_points_curr = []       # Tọa độ hiện tại của 4 góc ROI (sẽ thay đổi liên tục)
-        self.target_point = None        # Tọa độ hiện tại của Target
-        self.tracking_initialized = False # Cờ báo đã khởi tạo tracking chưa
+        # --- STABILIZER CONFIG (ANCHOR MODE) ---
+        self.lk_params = dict(winSize=(21, 21),
+                              maxLevel=3,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
         
+        # Biến lưu trữ "Mỏ neo" (Anchor)
+        self.gray_anchor = None        # Ảnh xám của Frame Gốc (lúc bắt đầu tracking)
+        self.p0_anchor = None          # Các điểm đặc trưng ở Frame Gốc
+        self.roi_points_initial = None # Tọa độ ROI gốc (cố định, không đổi)
+        self.roi_points_curr = None    # Tọa độ ROI hiện tại (biến đổi theo M)
+        
+        # Target Tracking
+        self.target_tracker = None
+        self.target_point = None        
+
         # Tools
         self.height_tool = HeightEstimator()
         self.yolo_model = None
         
-        # Data & Calibration
+        # Data
         self.real_world = {}
         self.cam_real_pos = (0.5, -18.0)
-        self.clicked_points_orig = []   # 4 điểm gốc từ config (chỉ dùng để init)
+        self.clicked_points_orig = []
         self.matrix_homography = None
         self.scale_px_per_meter = 1.0 
         self.map1, self.map2 = None, None
@@ -44,8 +53,9 @@ class VideoDistanceApp:
         # Runtime
         self.current_frame = None
         self.detected_objects = []
+        self.prev_time = 0
+        self.fps = 0
 
-        # Setup Device
         self.device = 'cpu'
         if torch.cuda.is_available():
             self.device = 0
@@ -53,9 +63,7 @@ class VideoDistanceApp:
         
         try:
             self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
-            print("[INFO] YOLO Model loaded.")
-        except Exception as e:
-            print(f"[ERR] Load YOLO failed: {e}")
+        except: pass
 
     def init_calibration_maps(self, frame_size):
         if not os.path.exists(CALIB_FILE): return
@@ -72,8 +80,7 @@ class VideoDistanceApp:
             new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, (w_curr, h_curr), 1, (w_curr, h_curr))
             self.map1, self.map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, (w_curr, h_curr), 5)
             self.height_tool.load_focal_length(CALIB_FILE, TARGET_W)
-        except Exception as e:
-            print(f"[ERR] Calibration Init: {e}")
+        except: pass
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return False
@@ -85,15 +92,14 @@ class VideoDistanceApp:
                 self.scale_px_per_meter = data['settings'].get('scale_px_per_meter', 1.0)
                 if 'points_px' in data:
                     self.clicked_points_orig = [tuple(p) for p in data['points_px']]
-                    # Ban đầu thì điểm hiện tại = điểm gốc
-                    self.roi_points_curr = list(self.clicked_points_orig)
-                    # Tính Homography lần đầu
+                    # Lưu bản gốc tuyệt đối
+                    self.roi_points_initial = np.array(self.clicked_points_orig, dtype=np.float32).reshape(-1, 1, 2)
+                    self.roi_points_curr = self.roi_points_initial.copy()
                     self.compute_homography(self.roi_points_curr)
                     return True
         except: return False
 
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
-        # Hàm tính toán hình học thực tế (giữ nguyên)
         if l1 + l2 < d13 or abs(l1 - l2) > d13: return []
         p1 = (0.0, 0.0); p2 = (l1, 0.0)
         cos_alpha = (l1**2 + d13**2 - l2**2) / (2 * l1 * d13)
@@ -107,24 +113,16 @@ class VideoDistanceApp:
         p4 = (x0 + h * rx, y0 + h * ry)
         return [p1, p2, p3, p4]
 
-    def compute_homography(self, current_pixel_points):
-        """
-        Tính lại Matrix Homography dựa trên 4 điểm pixel HIỆN TẠI (đã bị dịch chuyển)
-        so với 4 điểm thực tế (cố định).
-        """
-        if len(current_pixel_points) < 4: return
+    def compute_homography(self, current_pts_array):
+        if len(current_pts_array) < 4: return
         rw = self.real_world
         real_coords = self.get_quadrilateral_coords(rw['L1'], rw['L2'], rw['L3'], rw['L4'], rw['diag_13'])
         if not real_coords: return
-        
-        # Mapping: Pixel mới -> Real World cũ
         dst_pts = np.float32([[pt[0]*self.scale_px_per_meter, pt[1]*self.scale_px_per_meter] for pt in real_coords])
-        src_pts = np.float32(current_pixel_points)
-        
+        src_pts = current_pts_array.reshape(4, 2)
         try:
             self.matrix_homography = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        except:
-            pass # Tránh crash nếu tracking bị lỗi gây ra shape kỳ dị
+        except: pass
 
     def calculate_distance_points(self, p1, p2):
         if self.matrix_homography is None: return 0.0
@@ -133,42 +131,64 @@ class VideoDistanceApp:
         dist_px = np.linalg.norm(trans_pts[0][0] - trans_pts[1][0])
         return dist_px / self.scale_px_per_meter
 
-    # --- KHỞI TẠO TRACKER CHO 4 ĐIỂM ROI ---
-    def init_roi_tracking(self, frame):
-        self.roi_trackers = []
-        for pt in self.clicked_points_orig:
-            # Tạo vùng box nhỏ quanh điểm góc để track
-            x, y = pt
-            box_size = 30
-            bbox = (x - box_size//2, y - box_size//2, box_size, box_size)
-            
-            tracker = cv2.TrackerCSRT_create()
-            tracker.init(frame, bbox)
-            self.roi_trackers.append(tracker)
+    # ================= ANCHOR STABILIZER (NEW) =================
+    def init_anchor(self, gray_frame):
+        """
+        Khởi tạo Frame Gốc (Anchor). Mọi frame sau này sẽ được so sánh trực tiếp với Frame này.
+        """
+        self.gray_anchor = gray_frame.copy()
         
-        self.tracking_initialized = True
-        print("[TRACKING] Đã khởi tạo theo dõi 4 góc ROI.")
+        # Tạo mask để TRÁNH vùng sàn nhà (chỉ track cột, xe, tường)
+        mask = np.ones_like(gray_frame, dtype=np.uint8) * 255
+        if self.roi_points_initial is not None:
+            pts = self.roi_points_initial.astype(np.int32)
+            cv2.fillPoly(mask, [pts], 0) 
+        
+        # Tìm điểm đặc trưng mạnh ở background
+        self.p0_anchor = cv2.goodFeaturesToTrack(self.gray_anchor, mask=mask, maxCorners=300, qualityLevel=0.01, minDistance=10)
+        
+        print(f"[STABILIZER] Anchor Reset. Tracking {len(self.p0_anchor) if self.p0_anchor is not None else 0} points.")
 
-    # --- CẬP NHẬT TRACKER (ROI + TARGET) ---
-    def update_all_trackers(self, frame):
-        # 1. Update ROI Trackers
-        new_roi_points = []
-        if self.tracking_initialized:
-            for i, tracker in enumerate(self.roi_trackers):
-                success, box = tracker.update(frame)
-                if success:
-                    x, y, w, h = [int(v) for v in box]
-                    center = (x + w//2, y + h//2)
-                    new_roi_points.append(center)
-                else:
-                    # Nếu mất dấu, dùng lại điểm cũ
-                    new_roi_points.append(self.roi_points_curr[i])
+    def update_stabilizer(self, gray_curr):
+        """
+        Tính toán M: Frame Gốc -> Frame Hiện tại
+        """
+        if self.p0_anchor is None or len(self.p0_anchor) < 10:
+            self.init_anchor(gray_curr)
+            return
+
+        # Tính Optical Flow từ ANCHOR -> CURRENT (Không phải prev -> curr)
+        p1, st, err = cv2.calcOpticalFlowPyrLK(self.gray_anchor, gray_curr, self.p0_anchor, None, **self.lk_params)
+        
+        if p1 is not None:
+            good_new = p1[st == 1]
+            good_old = self.p0_anchor[st == 1]
             
-            # Cập nhật tọa độ ROI mới và tính lại Homography
-            self.roi_points_curr = new_roi_points
-            self.compute_homography(self.roi_points_curr)
+            # Cần đủ điểm để tính ma trận tin cậy
+            if len(good_new) > 20: 
+                # Tính Homography biến đổi: Gốc -> Hiện tại
+                M, _ = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
+                
+                if M is not None:
+                    # Biến đổi ROI Gốc theo M để ra ROI Hiện tại
+                    # Lưu ý: Luôn transform từ ROI GỐC (initial), không lấy cái cũ transform tiếp
+                    self.roi_points_curr = cv2.perspectiveTransform(self.roi_points_initial, M)
+                    self.compute_homography(self.roi_points_curr)
+                    
+                    # Debug: Vẽ điểm Anchor (màu xanh dương) để thấy nó "dính" vào nền
+                    for pt in good_new:
+                         x, y = pt.ravel()
+                         # Lưu vào danh sách để hàm draw vẽ sau (tùy chọn)
 
-        # 2. Update Target Point Tracker (nếu có)
+            # CƠ CHẾ TỰ RESET ANCHOR:
+            # Nếu số điểm track được giảm quá thấp (do camera quay đi chỗ khác mất view gốc)
+            # Thì ta buộc phải lấy frame hiện tại làm Anchor mới.
+            track_ratio = len(good_new) / len(self.p0_anchor)
+            if track_ratio < 0.4: # Mất 60% điểm track
+                print("[STABILIZER] Mất dấu quá nhiều -> Reset Anchor.")
+                self.init_anchor(gray_curr)
+
+    def update_target_tracker(self, frame):
         track_box = None
         if self.target_tracker is not None:
             success, box = self.target_tracker.update(frame)
@@ -177,12 +197,15 @@ class VideoDistanceApp:
                 self.target_point = (x + w//2, y + h//2)
                 track_box = (x, y, w, h)
             else:
-                self.target_tracker = None # Mất dấu thì hủy luôn
-
+                self.target_tracker = None
         return track_box
 
     def process_frame(self, raw_frame):
-        # 1. Pre-processing
+        curr_time = time.time()
+        self.fps = 1 / (curr_time - self.prev_time) if self.prev_time > 0 else 0
+        self.prev_time = curr_time
+
+        # 1. Undistort & Resize
         if self.map1 is not None:
             frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
         else: frame = raw_frame
@@ -191,22 +214,37 @@ class VideoDistanceApp:
         scale = TARGET_W / w
         new_h = int(h * scale)
         frame_resized = cv2.resize(frame, (TARGET_W, new_h))
-        
-        # 2. Khởi tạo Tracking ROI ở frame đầu tiên
-        if not self.tracking_initialized and len(self.clicked_points_orig) == 4:
-            self.init_roi_tracking(frame_resized)
+        frame_gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+
+        # 2. UPDATE STABILIZER (ANCHOR METHOD)
+        if self.gray_anchor is None:
+            self.init_anchor(frame_gray)
+        else:
+            self.update_stabilizer(frame_gray)
             
-        # 3. Update vị trí các điểm (ROI + Target)
-        target_box = self.update_all_trackers(frame_resized)
+        # 3. Target Tracking
+        target_box = self.update_target_tracker(frame_resized)
         
         # 4. Detect Object
         self.detect_objects(frame_resized)
         
+        self.frame_count += 1
         return frame_resized, target_box
 
     def detect_objects(self, img):
         if self.yolo_model is None: return
-        results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5)
+        
+        if self.frame_count % YOLO_SKIP_FRAMES != 0 and len(self.detected_objects) > 0:
+            for obj in self.detected_objects:
+                if self.mode == "HEIGHT":
+                    h_real, _ = self.height_tool.calculate(obj['head'], obj['foot'], self.matrix_homography, self.cam_real_pos)
+                    obj['h_real'] = h_real
+                elif self.mode == "DISTANCE" and self.target_point:
+                    d_target = self.calculate_distance_points(obj['foot'], self.target_point)
+                    obj['d_to_target'] = d_target
+            return 
+        
+        results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
         self.detected_objects = []
         
         for r in results:
@@ -227,7 +265,6 @@ class VideoDistanceApp:
 
                 obj_info = {'box': box, 'head': head_point, 'foot': ground_point, 'h_real': 0.0, 'd_to_target': 0.0}
                 
-                # Tính toán dựa trên Homography MỚI NHẤT
                 if self.mode == "HEIGHT":
                     h_real, _ = self.height_tool.calculate(head_point, ground_point, self.matrix_homography, self.cam_real_pos)
                     obj_info['h_real'] = h_real
@@ -238,15 +275,21 @@ class VideoDistanceApp:
                 self.detected_objects.append(obj_info)
 
     def draw_overlays(self, img, target_box):
-        # 1. Vẽ ROI (Sử dụng self.roi_points_curr để thấy nó di chuyển)
-        if len(self.roi_points_curr) == 4:
-            pts = np.array(self.roi_points_curr, np.int32).reshape((-1, 1, 2))
-            # Vẽ màu đỏ đậm hơn để dễ nhìn
-            cv2.polylines(img, [pts], True, (0, 0, 255), 2, cv2.LINE_AA)
-            for pt in self.roi_points_curr:
-                cv2.circle(img, pt, 3, (0, 0, 255), -1)
+        cv2.putText(img, f"FPS: {int(self.fps)}", (TARGET_W - 120, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 2. Vẽ Target Point
+        # ROI - Vẽ màu đỏ
+        if self.roi_points_curr is not None:
+            pts = self.roi_points_curr.reshape((-1, 1, 2)).astype(np.int32)
+            cv2.polylines(img, [pts], True, (0, 0, 255), 2, cv2.LINE_AA)
+            
+            # Vẽ các điểm neo Anchor còn tốt (xanh dương)
+            if self.p0_anchor is not None and self.gray_anchor is not None:
+                 # Logic vẽ điểm này hơi phức tạp vì p0 là ở frame gốc, 
+                 # cần transform M mới ra vị trí hiện tại. 
+                 # Nhưng để đơn giản, ta chỉ cần vẽ ROI đỏ là đủ thấy nó cứng hay không.
+                 pass
+
+        # Target Point
         if self.mode == "DISTANCE" and self.target_point:
             cv2.circle(img, self.target_point, 5, (0, 255, 255), -1)
             cv2.circle(img, self.target_point, 12, (0, 255, 255), 2)
@@ -254,7 +297,7 @@ class VideoDistanceApp:
                 tx, ty, tw, th = target_box
                 cv2.rectangle(img, (tx, ty), (tx+tw, ty+th), (0, 255, 255), 1)
 
-        # 3. Vẽ Object Info
+        # Objects
         for obj in self.detected_objects:
             x1, y1, x2, y2 = obj['box']
             foot = obj['foot']
@@ -270,12 +313,12 @@ class VideoDistanceApp:
                     mid = ((foot[0]+self.target_point[0])//2, (foot[1]+self.target_point[1])//2)
                     cv2.putText(img, f"{obj['d_to_target']:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
-        # 4. UI Status
+        # UI
         status_text = "PAUSED" if self.paused else "PLAYING"
         cv2.rectangle(img, (0, 0), (TARGET_W, 60), (0, 0, 0), -1)
         cv2.putText(img, f"MODE: {self.mode}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         cv2.putText(img, status_text, (350, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255) if self.paused else (0, 255, 0), 2)
-        cv2.putText(img, "AUTO ROI TRACKING ACTIVE", (TARGET_W - 350, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        cv2.putText(img, "STABILIZER: ANCHOR MODE", (TARGET_W - 400, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
 
 app = VideoDistanceApp()
 
@@ -286,11 +329,10 @@ def mouse_event_video(event, x, y, flags, param):
             box_size = 40
             bbox = (max(0, x - box_size//2), max(0, y - box_size//2), box_size, box_size)
             try:
-                app.target_tracker = cv2.TrackerCSRT_create()
+                app.target_tracker = cv2.TrackerKCF_create() 
                 app.target_tracker.init(app.current_frame, bbox)
-                print(f"[TARGET] Đã đặt & track điểm đích: {bbox}")
-            except:
-                print("[ERR] Không tạo được Target Tracker.")
+                print(f"[TARGET] Đã đặt Target: {bbox}")
+            except: pass
 
 def main():
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -301,16 +343,16 @@ def main():
     app.init_calibration_maps((width, height))
     app.load_config()
 
-    cv2.namedWindow("Smart ROI Tracking")
-    cv2.setMouseCallback("Smart ROI Tracking", mouse_event_video)
+    cv2.namedWindow("Anchor Tracking")
+    cv2.setMouseCallback("Anchor Tracking", mouse_event_video)
 
     while True:
         if not app.paused:
             ret, frame = cap.read()
             if not ret:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                # Khi video loop lại, cần reset tracker nếu muốn chính xác tuyệt đối, 
-                # nhưng ở đây ta cứ để nó chạy tiếp hoặc bạn có thể gọi init_roi_tracking lại.
+                # Khi loop video, phải reset Anchor vì cảnh quay lại từ đầu
+                app.gray_anchor = None 
                 continue
             app.current_frame, target_box = app.process_frame(frame)
         else:
@@ -318,9 +360,9 @@ def main():
 
         display_img = app.current_frame.copy()
         app.draw_overlays(display_img, target_box)
-        cv2.imshow("Smart ROI Tracking", display_img)
+        cv2.imshow("Anchor Tracking", display_img)
 
-        key = cv2.waitKey(30) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): break
         if key == ord(' '): app.paused = not app.paused
         if app.paused:
