@@ -174,7 +174,7 @@ class VideoDistanceApp:
             pts = self.roi_points_initial.astype(np.int32)
             cv2.fillPoly(mask, [pts], 0) 
 
-        # Mask 2 (QUAN TRỌNG): Loại bỏ vùng đang có người ngay từ đầu
+        # Mask 2: Loại bỏ vùng đang có người ngay từ đầu
         if len(self.last_known_boxes) > 0:
             for box in self.last_known_boxes:
                 x1, y1, x2, y2 = box
@@ -192,14 +192,13 @@ class VideoDistanceApp:
             self.init_anchor(gray_curr)
             return
 
-        # Tính Optical Flow từ ANCHOR -> CURRENT (Không phải prev -> curr)
+        # Tính Optical Flow từ ANCHOR -> CURRENT
         p1, st, err = cv2.calcOpticalFlowPyrLK(self.gray_anchor, gray_curr, self.p0_anchor, None, **self.lk_params)
         
         if p1 is not None:
             good_new = p1[st == 1]
             good_old = self.p0_anchor[st == 1]
             
-            # --- LỌC THÔNG MINH ---
             # Chỉ giữ lại các điểm KHÔNG nằm đè lên người
             # Nếu người đi qua điểm background, điểm đó sẽ bị loại bỏ tạm thời
             clean_new = []
@@ -219,7 +218,7 @@ class VideoDistanceApp:
                 
                 if M is not None:
                     # Biến đổi ROI Gốc theo M để ra ROI Hiện tại
-                    # Lưu ý: Luôn transform từ ROI GỐC (initial), không lấy cái cũ transform tiếp
+                    # Luôn transform từ ROI GỐC (initial), không lấy cái cũ transform tiếp
                     if self.roi_points_initial is not None:
                         self.roi_points_curr = cv2.perspectiveTransform(self.roi_points_initial, M)
                         self.compute_homography(self.roi_points_curr)
@@ -261,7 +260,7 @@ class VideoDistanceApp:
 
         # Chỉ chạy YOLO mỗi N frames để tối ưu, nhưng vẫn giữ box cũ
         if self.frame_count % YOLO_SKIP_FRAMES == 0:
-            results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
+            results = self.yolo_model(img, verbose=False, device=self.device, conf=0.6, imgsz=640)
             self.detected_objects = []
             self.last_known_boxes = [] # Reset box cũ
             
