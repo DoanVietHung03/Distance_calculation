@@ -105,7 +105,7 @@ class VideoDistanceApp:
                     self.roi_points_curr = self.roi_points_initial.copy()
                     self.compute_homography(self.roi_points_curr)
 
-                # 2. LOAD TARGET POINT (Xử lý giống ROI)
+                # 2. LOAD TARGET POINT
                 if 'target_point' in data:
                     tp = data['target_point']
                     # Chuyển thành numpy array (1, 1, 2)
