@@ -15,7 +15,7 @@ VIDEO_PATH = '..\\test_imgs\\cam_2\\cam_2.mp4'
 CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200 
-YOLO_SKIP_FRAMES = 3  # Giảm xuống 3 để mượt hơn chút
+YOLO_SKIP_FRAMES = 5
 
 class VideoDistanceApp:
     def __init__(self):
@@ -177,8 +177,8 @@ class VideoDistanceApp:
                     
                     # Debug: Vẽ điểm Anchor (màu xanh dương) để thấy nó "dính" vào nền
                     for pt in good_new:
-                         x, y = pt.ravel()
-                         # Lưu vào danh sách để hàm draw vẽ sau (tùy chọn)
+                        x, y = pt.ravel()
+                        # Lưu vào danh sách để hàm draw vẽ sau (tùy chọn)
 
             # CƠ CHẾ TỰ RESET ANCHOR:
             # Nếu số điểm track được giảm quá thấp (do camera quay đi chỗ khác mất view gốc)
@@ -287,7 +287,7 @@ class VideoDistanceApp:
                  # Logic vẽ điểm này hơi phức tạp vì p0 là ở frame gốc, 
                  # cần transform M mới ra vị trí hiện tại. 
                  # Nhưng để đơn giản, ta chỉ cần vẽ ROI đỏ là đủ thấy nó cứng hay không.
-                 pass
+                pass
 
         # Target Point
         if self.mode == "DISTANCE" and self.target_point:
@@ -316,9 +316,8 @@ class VideoDistanceApp:
         # UI
         status_text = "PAUSED" if self.paused else "PLAYING"
         cv2.rectangle(img, (0, 0), (TARGET_W, 60), (0, 0, 0), -1)
-        cv2.putText(img, f"MODE: {self.mode}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-        cv2.putText(img, status_text, (350, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255) if self.paused else (0, 255, 0), 2)
-        cv2.putText(img, "STABILIZER: ANCHOR MODE", (TARGET_W - 400, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        cv2.putText(img, f"MODE: {self.mode}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(img, status_text, (350, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if self.paused else (0, 255, 0), 1)
 
 app = VideoDistanceApp()
 
@@ -326,7 +325,7 @@ def mouse_event_video(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         if app.mode == "DISTANCE":
             app.target_point = (x, y)
-            box_size = 40
+            box_size = 20
             bbox = (max(0, x - box_size//2), max(0, y - box_size//2), box_size, box_size)
             try:
                 app.target_tracker = cv2.TrackerKCF_create() 
