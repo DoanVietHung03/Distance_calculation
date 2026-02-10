@@ -150,17 +150,9 @@ class VideoDistanceApp:
         dist_px = np.linalg.norm(trans_pts[0][0] - trans_pts[1][0])
         return dist_px / self.scale_px_per_meter
 
-    # ================= ANCHOR STABILIZER =================
-    def is_point_in_boxes(self, point, boxes):
-        """Kiểm tra xem điểm có nằm trong bất kỳ bounding box nào không"""
-        x, y = point.ravel()
-        for box in boxes:
-            bx1, by1, bx2, by2 = box
-            # Mở rộng box một chút (padding) để an toàn hơn
-            pad = 10
-            if (bx1 - pad) < x < (bx2 + pad) and (by1 - pad) < y < (by2 + pad):
-                return True
-        return False
+    # ================= ANCHOR STABILIZER (OPTIMIZED) =================
+    
+    # Đã xóa hàm is_point_in_boxes để tối ưu hóa
 
     def init_anchor(self, gray_frame):
         """
@@ -199,19 +191,37 @@ class VideoDistanceApp:
             good_new = p1[st == 1]
             good_old = self.p0_anchor[st == 1]
             
+            # --- TỐI ƯU HÓA: Dùng Mask Numpy thay vì vòng lặp for ---
             # Chỉ giữ lại các điểm KHÔNG nằm đè lên người
-            # Nếu người đi qua điểm background, điểm đó sẽ bị loại bỏ tạm thời
-            clean_new = []
-            clean_old = []
-            
-            for i in range(len(good_new)):
-                # Kiểm tra điểm mới có rơi vào vùng người đang đi không?
-                if not self.is_point_in_boxes(good_new[i], self.last_known_boxes):
-                    clean_new.append(good_new[i])
-                    clean_old.append(good_old[i])
-            
-            clean_new = np.array(clean_new)
-            clean_old = np.array(clean_old)
+            if len(self.last_known_boxes) > 0:
+                h_img, w_img = gray_curr.shape
+                # Tạo mask đen (0)
+                mask_boxes = np.zeros((h_img, w_img), dtype=np.uint8)
+                
+                # Vẽ các box màu trắng (255) lên mask
+                for box in self.last_known_boxes:
+                    x1, y1, x2, y2 = box
+                    # Mở rộng pad 10px như logic cũ
+                    cv2.rectangle(mask_boxes, (max(0, x1-10), max(0, y1-10)), (min(w_img, x2+10), min(h_img, y2+10)), 255, -1)
+                
+                # Chuyển tọa độ điểm thành số nguyên để index matrix
+                pts_int = good_new.astype(int)
+                
+                # Clip tọa độ để không bị lỗi index out of bounds
+                pts_int[:, 0] = np.clip(pts_int[:, 0], 0, w_img - 1)
+                pts_int[:, 1] = np.clip(pts_int[:, 1], 0, h_img - 1)
+                
+                # Kiểm tra điểm nào rơi vào vùng màu trắng (255)
+                # mask_boxes[y, x] > 0
+                is_on_person = mask_boxes[pts_int[:, 1], pts_int[:, 0]] > 0
+                
+                # Giữ lại điểm KHÔNG nằm trên người (~is_on_person)
+                clean_new = good_new[~is_on_person]
+                clean_old = good_old[~is_on_person]
+            else:
+                clean_new = good_new
+                clean_old = good_old
+            # ------------------------------------------------
 
             if len(clean_new) > 10: # Cần đủ điểm sạch để tính
                 M, mask_ransac = cv2.findHomography(clean_old, clean_new, cv2.RANSAC, 5.0)
@@ -223,12 +233,12 @@ class VideoDistanceApp:
                         self.roi_points_curr = cv2.perspectiveTransform(self.roi_points_initial, M)
                         self.compute_homography(self.roi_points_curr)
                     
-                    # 2. Transform TARGET POINT 
+                    # Transform TARGET POINT 
                     if self.target_point_initial is not None:
                         self.target_point_curr = cv2.perspectiveTransform(self.target_point_initial, M)
 
-            # Reset nếu mất quá nhiều điểm (do bị người che hết hoặc camera quay đi)
-            track_ratio = len(clean_new) / len(self.p0_anchor)
+            # Reset nếu mất quá nhiều điểm
+            track_ratio = len(clean_new) / (len(self.p0_anchor) + 1e-5) # +1e-5 để tránh chia cho 0
             if track_ratio < 0.3:
                 print("[STABILIZER] Điểm sạch quá ít -> Reset Anchor.")
                 self.init_anchor(gray_curr)
