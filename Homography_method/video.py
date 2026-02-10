@@ -23,7 +23,7 @@ class VideoDistanceApp:
         self.paused = False
         self.frame_count = 0
         
-        # --- STABILIZER CONFIG (ANCHOR MODE) ---
+        # --- STABILIZER CONFIG ---
         self.lk_params = dict(winSize=(21, 21),
                               maxLevel=3,
                               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -32,16 +32,16 @@ class VideoDistanceApp:
         self.gray_anchor = None        # Ảnh xám của Frame Gốc (lúc bắt đầu tracking)
         self.p0_anchor = None          # Các điểm đặc trưng ở Frame Gốc
         
-        # --- ROI POINTS ---
+        # --- ROI POINTS AND TARGET ---
         self.roi_points_initial = None # Tọa độ ROI gốc (cố định theo JSON)
         self.roi_points_curr = None    # Tọa độ ROI hiện tại (biến đổi theo M)
+        # --- TARGET POINT ---
+        self.target_point_initial = None
+        self.target_point_curr = None
         
-        # --- TARGET POINT (MỚI) ---
-        # Lưu dạng numpy array (1, 1, 2) để dùng được với cv2.perspectiveTransform
-        self.target_point_initial = None # Tọa độ Target gốc (từ JSON)
-        self.target_point_curr = None    # Tọa độ Target hiện tại (đã chống rung)
+        # --- ANTI-OCCLUSION DATA ---
+        self.last_known_boxes = [] # Lưu vị trí người để né
         
-        # Target Tracking (Optional - dùng KCF nếu click chuột, ở đây ưu tiên dùng Anchor)
         self.target_tracker = None
 
         # Tools
@@ -125,8 +125,8 @@ class VideoDistanceApp:
         d = d13; a = (l4**2 - l3**2 + d**2) / (2*d)
         h = math.sqrt(max(0, l4**2 - a**2))
         x0 = p1[0] + a * (p3[0] - p1[0]) / d; y0 = p1[1] + a * (p3[1] - p1[1]) / d
-        rx = -(p3[1] - p1[0]) / d; ry = (p3[0] - p1[0]) / d # (Fixed vector typo from prev version if any)
-        # Recalculate properly to be safe
+        rx = -(p3[1] - p1[1]) / d; ry = (p3[0] - p1[0]) / d
+        # Fix vector direction
         vx = (p3[0] - p1[0]) / d; vy = (p3[1] - p1[1]) / d
         rx = -vy; ry = vx
         p4 = (x0 + h * rx, y0 + h * ry)
@@ -151,20 +151,38 @@ class VideoDistanceApp:
         return dist_px / self.scale_px_per_meter
 
     # ================= ANCHOR STABILIZER =================
+    def is_point_in_boxes(self, point, boxes):
+        """Kiểm tra xem điểm có nằm trong bất kỳ bounding box nào không"""
+        x, y = point.ravel()
+        for box in boxes:
+            bx1, by1, bx2, by2 = box
+            # Mở rộng box một chút (padding) để an toàn hơn
+            pad = 10
+            if (bx1 - pad) < x < (bx2 + pad) and (by1 - pad) < y < (by2 + pad):
+                return True
+        return False
+
     def init_anchor(self, gray_frame):
         """
         Khởi tạo Frame Gốc (Anchor). Mọi frame sau này sẽ được so sánh trực tiếp với Frame này.
         """
         self.gray_anchor = gray_frame.copy()
         
+        # Mask 1: Loại bỏ vùng bên ngoài ROI (nếu có)
         mask = np.ones_like(gray_frame, dtype=np.uint8) * 255
         if self.roi_points_initial is not None:
             pts = self.roi_points_initial.astype(np.int32)
             cv2.fillPoly(mask, [pts], 0) 
+
+        # Mask 2 (QUAN TRỌNG): Loại bỏ vùng đang có người ngay từ đầu
+        if len(self.last_known_boxes) > 0:
+            for box in self.last_known_boxes:
+                x1, y1, x2, y2 = box
+                # Vẽ màu đen (0) vào vùng có người để goodFeaturesToTrack bỏ qua
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
         
         self.p0_anchor = cv2.goodFeaturesToTrack(self.gray_anchor, mask=mask, maxCorners=300, qualityLevel=0.01, minDistance=10)
-        
-        print(f"[STABILIZER] Anchor Reset. Tracking {len(self.p0_anchor) if self.p0_anchor is not None else 0} points.")
+        print(f"[STABILIZER] Anchor Reset. Points: {len(self.p0_anchor) if self.p0_anchor is not None else 0}")
 
     def update_stabilizer(self, gray_curr):
         """
@@ -181,10 +199,23 @@ class VideoDistanceApp:
             good_new = p1[st == 1]
             good_old = self.p0_anchor[st == 1]
             
-            # Cần đủ điểm để tính ma trận tin cậy
-            if len(good_new) > 20: 
-                # Tính Homography biến đổi: Gốc -> Hiện tại
-                M, _ = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
+            # --- LỌC THÔNG MINH ---
+            # Chỉ giữ lại các điểm KHÔNG nằm đè lên người
+            # Nếu người đi qua điểm background, điểm đó sẽ bị loại bỏ tạm thời
+            clean_new = []
+            clean_old = []
+            
+            for i in range(len(good_new)):
+                # Kiểm tra điểm mới có rơi vào vùng người đang đi không?
+                if not self.is_point_in_boxes(good_new[i], self.last_known_boxes):
+                    clean_new.append(good_new[i])
+                    clean_old.append(good_old[i])
+            
+            clean_new = np.array(clean_new)
+            clean_old = np.array(clean_old)
+
+            if len(clean_new) > 10: # Cần đủ điểm sạch để tính
+                M, mask_ransac = cv2.findHomography(clean_old, clean_new, cv2.RANSAC, 5.0)
                 
                 if M is not None:
                     # Biến đổi ROI Gốc theo M để ra ROI Hiện tại
@@ -196,17 +227,12 @@ class VideoDistanceApp:
                     # 2. Transform TARGET POINT 
                     if self.target_point_initial is not None:
                         self.target_point_curr = cv2.perspectiveTransform(self.target_point_initial, M)
-            # CƠ CHẾ TỰ RESET ANCHOR:
-            # Nếu số điểm track được giảm quá thấp (do camera quay đi chỗ khác mất view gốc)
-            # Thì ta buộc phải lấy frame hiện tại làm Anchor mới.
-            track_ratio = len(good_new) / len(self.p0_anchor)
-            if track_ratio < 0.4: # Mất 60% điểm track
-                print("[STABILIZER] Mất dấu quá nhiều -> Reset Anchor.")
+
+            # Reset nếu mất quá nhiều điểm (do bị người che hết hoặc camera quay đi)
+            track_ratio = len(clean_new) / len(self.p0_anchor)
+            if track_ratio < 0.3:
+                print("[STABILIZER] Điểm sạch quá ít -> Reset Anchor.")
                 self.init_anchor(gray_curr)
-                # Lưu ý: Khi reset Anchor, ta coi frame hiện tại là gốc.
-                # Nếu muốn tiếp tục track đúng vị trí cũ, logic sẽ phức tạp hơn.
-                # Ở mức cơ bản, khi reset anchor, target point sẽ quay về vị trí 'initial' 
-                # tương ứng với frame này (điều này có thể gây nhảy nhẹ nếu frame lệch nhiều).
 
     def get_current_target_tuple(self):
         """Helper để lấy tọa độ (x, y) từ numpy array"""
@@ -229,12 +255,58 @@ class VideoDistanceApp:
                 self.target_tracker = None
         return track_box
 
+    def detect_objects_and_update_boxes(self, img):
+        """Hàm này vừa detect YOLO vừa cập nhật box cho Stabilizer né"""
+        if self.yolo_model is None: return
+
+        # Chỉ chạy YOLO mỗi N frames để tối ưu, nhưng vẫn giữ box cũ
+        if self.frame_count % YOLO_SKIP_FRAMES == 0:
+            results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
+            self.detected_objects = []
+            self.last_known_boxes = [] # Reset box cũ
+            
+            target_pt = self.get_current_target_tuple()
+
+            for r in results:
+                boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+                kpts_data = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
+                
+                for i, box in enumerate(boxes):
+                    # Lưu box vào danh sách "cấm" cho Stabilizer
+                    self.last_known_boxes.append(box)
+                    
+                    x1, y1, x2, y2 = box
+                    ground_point = (int((x1+x2)/2), y2)
+                    head_point = (int((x1+x2)/2), y1)
+                    
+                    if kpts_data is not None and len(kpts_data) > i:
+                        kp = kpts_data[i]
+                        if kp[15][2] > 0.5 and kp[16][2] > 0.5:
+                            ground_point = (int((kp[15][0]+kp[16][0])/2), int((kp[15][1]+kp[16][1])/2))
+                        if kp[0][2] > 0.5:
+                            head_point = (int(kp[0][0]), int(kp[0][1]))
+
+                    obj_info = {'box': box, 'head': head_point, 'foot': ground_point, 'h_real': 0.0, 'd_to_target': 0.0}
+                    
+                    if self.mode == "HEIGHT":
+                        h_real, _ = self.height_tool.calculate(head_point, ground_point, self.matrix_homography, self.cam_real_pos)
+                        obj_info['h_real'] = h_real
+                    elif self.mode == "DISTANCE" and target_pt:
+                        d_target = self.calculate_distance_points(ground_point, target_pt)
+                        obj_info['d_to_target'] = d_target
+                    
+                    self.detected_objects.append(obj_info)
+        else:
+            # Nếu skip frame YOLO, ta vẫn cần tính lại khoảng cách cho các object cũ
+            # (Vì camera có thể rung, object vẫn di chuyển trong logic code cũ, 
+            # nhưng ở đây ta chỉ dùng box cũ để né Optical Flow thôi)
+            pass
+
     def process_frame(self, raw_frame):
         curr_time = time.time()
         self.fps = 1 / (curr_time - self.prev_time) if self.prev_time > 0 else 0
         self.prev_time = curr_time
 
-        # 1. Undistort & Resize
         if self.map1 is not None:
             frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
         else: frame = raw_frame
@@ -245,65 +317,25 @@ class VideoDistanceApp:
         frame_resized = cv2.resize(frame, (TARGET_W, new_h))
         frame_gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
 
-        # 2. UPDATE STABILIZER (ANCHOR METHOD)
+        # 1. Chạy Detect trước để lấy Bounding Box (cho Stabilizer né)
+        # Lưu ý: Logic cũ chạy detect sau, nhưng giờ ta cần vị trí người TRƯỚC khi tính flow
+        # Tuy nhiên, nếu chạy detect trước thì hơi lag nếu máy yếu. 
+        # Tốt nhất: Dùng Box của frame TRƯỚC ĐÓ (self.last_known_boxes) để né cho frame NAY.
+        # Sai số vị trí người giữa 1 frame (33ms) là không đáng kể.
+        
+        # 2. Update Stabilizer (Dùng box của frame cũ hoặc frame detect gần nhất)
         if self.gray_anchor is None:
             self.init_anchor(frame_gray)
         else:
             self.update_stabilizer(frame_gray)
             
-        # 3. Target Tracking
         target_box = self.update_target_tracker(frame_resized)
         
-        # 4. Detect Object
-        self.detect_objects(frame_resized)
+        # 3. Detect object (Cập nhật box mới cho vòng lặp sau)
+        self.detect_objects_and_update_boxes(frame_resized)
         
         self.frame_count += 1
         return frame_resized, target_box
-
-    def detect_objects(self, img):
-        if self.yolo_model is None: return
-        
-        target_pt = self.get_current_target_tuple()
-
-        if self.frame_count % YOLO_SKIP_FRAMES != 0 and len(self.detected_objects) > 0:
-            for obj in self.detected_objects:
-                if self.mode == "HEIGHT":
-                    h_real, _ = self.height_tool.calculate(obj['head'], obj['foot'], self.matrix_homography, self.cam_real_pos)
-                    obj['h_real'] = h_real
-                elif self.mode == "DISTANCE" and target_pt:
-                    d_target = self.calculate_distance_points(obj['foot'], target_pt)
-                    obj['d_to_target'] = d_target
-            return 
-        
-        results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
-        self.detected_objects = []
-        
-        for r in results:
-            boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-            kpts_data = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
-            
-            for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = box
-                ground_point = (int((x1+x2)/2), y2)
-                head_point = (int((x1+x2)/2), y1)
-                
-                if kpts_data is not None and len(kpts_data) > i:
-                    kp = kpts_data[i]
-                    if kp[15][2] > 0.5 and kp[16][2] > 0.5:
-                        ground_point = (int((kp[15][0]+kp[16][0])/2), int((kp[15][1]+kp[16][1])/2))
-                    if kp[0][2] > 0.5:
-                        head_point = (int(kp[0][0]), int(kp[0][1]))
-
-                obj_info = {'box': box, 'head': head_point, 'foot': ground_point, 'h_real': 0.0, 'd_to_target': 0.0}
-                
-                if self.mode == "HEIGHT":
-                    h_real, _ = self.height_tool.calculate(head_point, ground_point, self.matrix_homography, self.cam_real_pos)
-                    obj_info['h_real'] = h_real
-                elif self.mode == "DISTANCE" and target_pt:
-                    d_target = self.calculate_distance_points(ground_point, target_pt)
-                    obj_info['d_to_target'] = d_target
-                
-                self.detected_objects.append(obj_info)
 
     def draw_overlays(self, img, target_box):
         cv2.putText(img, f"FPS: {int(self.fps)}", (TARGET_W - 120, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
