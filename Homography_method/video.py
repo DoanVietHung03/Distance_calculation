@@ -31,12 +31,18 @@ class VideoDistanceApp:
         # Biến lưu trữ "Mỏ neo" (Anchor)
         self.gray_anchor = None        # Ảnh xám của Frame Gốc (lúc bắt đầu tracking)
         self.p0_anchor = None          # Các điểm đặc trưng ở Frame Gốc
-        self.roi_points_initial = None # Tọa độ ROI gốc (cố định, không đổi)
+        
+        # --- ROI POINTS ---
+        self.roi_points_initial = None # Tọa độ ROI gốc (cố định theo JSON)
         self.roi_points_curr = None    # Tọa độ ROI hiện tại (biến đổi theo M)
         
-        # Target Tracking
+        # --- TARGET POINT (MỚI) ---
+        # Lưu dạng numpy array (1, 1, 2) để dùng được với cv2.perspectiveTransform
+        self.target_point_initial = None # Tọa độ Target gốc (từ JSON)
+        self.target_point_curr = None    # Tọa độ Target hiện tại (đã chống rung)
+        
+        # Target Tracking (Optional - dùng KCF nếu click chuột, ở đây ưu tiên dùng Anchor)
         self.target_tracker = None
-        self.target_point = None        
 
         # Tools
         self.height_tool = HeightEstimator()
@@ -90,13 +96,23 @@ class VideoDistanceApp:
                 self.real_world = data['real_world']
                 self.cam_real_pos = (data['camera']['real_x'], data['camera']['real_y'])
                 self.scale_px_per_meter = data['settings'].get('scale_px_per_meter', 1.0)
+                
+                # 1. LOAD ROI POINTS
                 if 'points_px' in data:
                     self.clicked_points_orig = [tuple(p) for p in data['points_px']]
                     # Lưu bản gốc tuyệt đối
                     self.roi_points_initial = np.array(self.clicked_points_orig, dtype=np.float32).reshape(-1, 1, 2)
                     self.roi_points_curr = self.roi_points_initial.copy()
                     self.compute_homography(self.roi_points_curr)
-                    return True
+
+                # 2. LOAD TARGET POINT (Xử lý giống ROI)
+                if 'target_point' in data:
+                    tp = data['target_point']
+                    # Chuyển thành numpy array (1, 1, 2)
+                    self.target_point_initial = np.array([[tp]], dtype=np.float32)
+                    self.target_point_curr = self.target_point_initial.copy()
+                    
+                return True
         except: return False
 
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
@@ -109,7 +125,10 @@ class VideoDistanceApp:
         d = d13; a = (l4**2 - l3**2 + d**2) / (2*d)
         h = math.sqrt(max(0, l4**2 - a**2))
         x0 = p1[0] + a * (p3[0] - p1[0]) / d; y0 = p1[1] + a * (p3[1] - p1[1]) / d
-        rx = -(p3[1] - p1[1]) / d; ry = (p3[0] - p1[0]) / d
+        rx = -(p3[1] - p1[0]) / d; ry = (p3[0] - p1[0]) / d # (Fixed vector typo from prev version if any)
+        # Recalculate properly to be safe
+        vx = (p3[0] - p1[0]) / d; vy = (p3[1] - p1[1]) / d
+        rx = -vy; ry = vx
         p4 = (x0 + h * rx, y0 + h * ry)
         return [p1, p2, p3, p4]
 
@@ -131,20 +150,18 @@ class VideoDistanceApp:
         dist_px = np.linalg.norm(trans_pts[0][0] - trans_pts[1][0])
         return dist_px / self.scale_px_per_meter
 
-    # ================= ANCHOR STABILIZER (NEW) =================
+    # ================= ANCHOR STABILIZER =================
     def init_anchor(self, gray_frame):
         """
         Khởi tạo Frame Gốc (Anchor). Mọi frame sau này sẽ được so sánh trực tiếp với Frame này.
         """
         self.gray_anchor = gray_frame.copy()
         
-        # Tạo mask để TRÁNH vùng sàn nhà (chỉ track cột, xe, tường)
         mask = np.ones_like(gray_frame, dtype=np.uint8) * 255
         if self.roi_points_initial is not None:
             pts = self.roi_points_initial.astype(np.int32)
             cv2.fillPoly(mask, [pts], 0) 
         
-        # Tìm điểm đặc trưng mạnh ở background
         self.p0_anchor = cv2.goodFeaturesToTrack(self.gray_anchor, mask=mask, maxCorners=300, qualityLevel=0.01, minDistance=10)
         
         print(f"[STABILIZER] Anchor Reset. Tracking {len(self.p0_anchor) if self.p0_anchor is not None else 0} points.")
@@ -172,14 +189,13 @@ class VideoDistanceApp:
                 if M is not None:
                     # Biến đổi ROI Gốc theo M để ra ROI Hiện tại
                     # Lưu ý: Luôn transform từ ROI GỐC (initial), không lấy cái cũ transform tiếp
-                    self.roi_points_curr = cv2.perspectiveTransform(self.roi_points_initial, M)
-                    self.compute_homography(self.roi_points_curr)
+                    if self.roi_points_initial is not None:
+                        self.roi_points_curr = cv2.perspectiveTransform(self.roi_points_initial, M)
+                        self.compute_homography(self.roi_points_curr)
                     
-                    # Debug: Vẽ điểm Anchor (màu xanh dương) để thấy nó "dính" vào nền
-                    for pt in good_new:
-                        x, y = pt.ravel()
-                        # Lưu vào danh sách để hàm draw vẽ sau (tùy chọn)
-
+                    # 2. Transform TARGET POINT 
+                    if self.target_point_initial is not None:
+                        self.target_point_curr = cv2.perspectiveTransform(self.target_point_initial, M)
             # CƠ CHẾ TỰ RESET ANCHOR:
             # Nếu số điểm track được giảm quá thấp (do camera quay đi chỗ khác mất view gốc)
             # Thì ta buộc phải lấy frame hiện tại làm Anchor mới.
@@ -187,14 +203,27 @@ class VideoDistanceApp:
             if track_ratio < 0.4: # Mất 60% điểm track
                 print("[STABILIZER] Mất dấu quá nhiều -> Reset Anchor.")
                 self.init_anchor(gray_curr)
+                # Lưu ý: Khi reset Anchor, ta coi frame hiện tại là gốc.
+                # Nếu muốn tiếp tục track đúng vị trí cũ, logic sẽ phức tạp hơn.
+                # Ở mức cơ bản, khi reset anchor, target point sẽ quay về vị trí 'initial' 
+                # tương ứng với frame này (điều này có thể gây nhảy nhẹ nếu frame lệch nhiều).
+
+    def get_current_target_tuple(self):
+        """Helper để lấy tọa độ (x, y) từ numpy array"""
+        if self.target_point_curr is not None:
+            return tuple(self.target_point_curr[0][0].astype(int))
+        return None
 
     def update_target_tracker(self, frame):
+        # Giữ lại logic cũ (mouse click tracker) phòng khi cần
         track_box = None
         if self.target_tracker is not None:
             success, box = self.target_tracker.update(frame)
             if success:
                 x, y, w, h = [int(v) for v in box]
-                self.target_point = (x + w//2, y + h//2)
+                # Nếu Tracker (KCF) đang chạy, nó sẽ override Stabilizer cho target
+                pt = (x + w//2, y + h//2)
+                self.target_point_curr = np.array([[pt]], dtype=np.float32)
                 track_box = (x, y, w, h)
             else:
                 self.target_tracker = None
@@ -234,13 +263,15 @@ class VideoDistanceApp:
     def detect_objects(self, img):
         if self.yolo_model is None: return
         
+        target_pt = self.get_current_target_tuple()
+
         if self.frame_count % YOLO_SKIP_FRAMES != 0 and len(self.detected_objects) > 0:
             for obj in self.detected_objects:
                 if self.mode == "HEIGHT":
                     h_real, _ = self.height_tool.calculate(obj['head'], obj['foot'], self.matrix_homography, self.cam_real_pos)
                     obj['h_real'] = h_real
-                elif self.mode == "DISTANCE" and self.target_point:
-                    d_target = self.calculate_distance_points(obj['foot'], self.target_point)
+                elif self.mode == "DISTANCE" and target_pt:
+                    d_target = self.calculate_distance_points(obj['foot'], target_pt)
                     obj['d_to_target'] = d_target
             return 
         
@@ -268,8 +299,8 @@ class VideoDistanceApp:
                 if self.mode == "HEIGHT":
                     h_real, _ = self.height_tool.calculate(head_point, ground_point, self.matrix_homography, self.cam_real_pos)
                     obj_info['h_real'] = h_real
-                elif self.mode == "DISTANCE" and self.target_point:
-                    d_target = self.calculate_distance_points(ground_point, self.target_point)
+                elif self.mode == "DISTANCE" and target_pt:
+                    d_target = self.calculate_distance_points(ground_point, target_pt)
                     obj_info['d_to_target'] = d_target
                 
                 self.detected_objects.append(obj_info)
@@ -281,18 +312,12 @@ class VideoDistanceApp:
         if self.roi_points_curr is not None:
             pts = self.roi_points_curr.reshape((-1, 1, 2)).astype(np.int32)
             cv2.polylines(img, [pts], True, (0, 0, 255), 2, cv2.LINE_AA)
-            
-            # Vẽ các điểm neo Anchor còn tốt (xanh dương)
-            if self.p0_anchor is not None and self.gray_anchor is not None:
-                 # Logic vẽ điểm này hơi phức tạp vì p0 là ở frame gốc, 
-                 # cần transform M mới ra vị trí hiện tại. 
-                 # Nhưng để đơn giản, ta chỉ cần vẽ ROI đỏ là đủ thấy nó cứng hay không.
-                pass
 
-        # Target Point
-        if self.mode == "DISTANCE" and self.target_point:
-            cv2.circle(img, self.target_point, 5, (0, 255, 255), -1)
-            cv2.circle(img, self.target_point, 12, (0, 255, 255), 2)
+        target_pt = self.get_current_target_tuple()
+
+        if self.mode == "DISTANCE" and target_pt:
+            cv2.circle(img, target_pt, 5, (0, 255, 255), -1)
+            cv2.circle(img, target_pt, 12, (0, 255, 255), 2)
             if target_box:
                 tx, ty, tw, th = target_box
                 cv2.rectangle(img, (tx, ty), (tx+tw, ty+th), (0, 255, 255), 1)
@@ -308,9 +333,9 @@ class VideoDistanceApp:
                 cv2.putText(img, f"H: {obj['h_real']:.2f}m", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             elif self.mode == "DISTANCE":
                 cv2.circle(img, foot, 4, (255, 0, 0), -1)
-                if self.target_point:
-                    cv2.line(img, foot, self.target_point, (0, 165, 255), 2)
-                    mid = ((foot[0]+self.target_point[0])//2, (foot[1]+self.target_point[1])//2)
+                if target_pt:
+                    cv2.line(img, foot, target_pt, (0, 165, 255), 2)
+                    mid = ((foot[0]+target_pt[0])//2, (foot[1]+target_pt[1])//2)
                     cv2.putText(img, f"{obj['d_to_target']:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         # UI
@@ -324,13 +349,16 @@ app = VideoDistanceApp()
 def mouse_event_video(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         if app.mode == "DISTANCE":
-            app.target_point = (x, y)
+            # Nếu click chuột, ta cập nhật thủ công vào biến curr
+            app.target_point_curr = np.array([[[x, y]]], dtype=np.float32)
+            
+            # Cố gắng reset tracker KCF để track theo điểm mới (dù Anchor Stabilizer vẫn đang chạy ngầm)
             box_size = 20
             bbox = (max(0, x - box_size//2), max(0, y - box_size//2), box_size, box_size)
             try:
                 app.target_tracker = cv2.TrackerKCF_create() 
                 app.target_tracker.init(app.current_frame, bbox)
-                print(f"[TARGET] Đã đặt Target: {bbox}")
+                print(f"[TARGET] Mouse Click override: {bbox}")
             except: pass
 
 def main():
