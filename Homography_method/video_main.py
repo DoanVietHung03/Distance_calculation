@@ -18,11 +18,11 @@ except ImportError:
 
 # ================= CẤU HÌNH =================
 VIDEO_PATH = r'../test_imgs/cam_2/cam_2.mp4' 
-CALIB_FILE = 'calibration.json' 
+CALIB_FILE = r'../calibration.json' 
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200 
 
-# ================= CLASS YOLO (GIỮ NGUYÊN) =================
+# ================= CLASS YOLO =================
 class YOLOThread(threading.Thread):
     def __init__(self, model_path, device):
         threading.Thread.__init__(self)
@@ -96,6 +96,9 @@ class VideoDistanceApp:
         self.ai_thread.daemon = True
         self.ai_thread.start()
         self.latest_detections = []
+        
+        self.distance_history = {} # Key: ID đối tượng, Value: List các khoảng cách gần đây
+        self.MAX_HISTORY = 5
 
     def load_json(self, path):
         if os.path.exists(path):
@@ -109,14 +112,26 @@ class VideoDistanceApp:
             self.scale_px_per_meter = data['settings'].get('scale_px_per_meter', 1.0)
 
     def smart_undistort(self, img):
-        if not self.calib_data: return img
+        if self.calib_data is None: return img
         try:
-            h, w = img.shape[:2]
+            h_curr, w_curr = img.shape[:2]
             K = np.array(self.calib_data['camera_matrix'])
             D = np.array(self.calib_data['distortion_coefficients'])
-            new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 1, (w, h))
-            return cv2.undistort(img, K, D, None, new_K)
-        except: return img
+            
+            # Tính toán lại K nếu kích thước video khác kích thước calib
+            if 'image_resolution' in self.calib_data:
+                calib_w, calib_h = self.calib_data['image_resolution']
+                if w_curr != calib_w or h_curr != calib_h:
+                    scale_x = w_curr / calib_w
+                    scale_y = h_curr / calib_h
+                    K[0, 0] *= scale_x; K[1, 1] *= scale_y
+                    K[0, 2] *= scale_x; K[1, 2] *= scale_y
+            
+            new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w_curr, h_curr), 1, (w_curr, h_curr))
+            map1, map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, (w_curr, h_curr), 5)
+            return cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+        except:
+            return img
 
     # Hàm tính toán Real World Coords (Giữ nguyên logic hình học của bạn)
     def get_real_coords_from_params(self):
@@ -190,12 +205,21 @@ class VideoDistanceApp:
         # B1. Đưa chân người về hệ tọa độ gốc
         p_foot_static = self.transform_point_inverse(p_foot_current)
         
+        if len(self.clicked_points) == 4:
+            roi_poly = np.array(self.clicked_points, dtype=np.int32)
+            # pointPolygonTest: >0 là bên trong, <0 là bên ngoài. 
+            # Ta cho phép sai số ra ngoài khoảng 50 pixel (-50)
+            dist_to_roi = cv2.pointPolygonTest(roi_poly, p_foot_static, True)
+            if dist_to_roi < -50: 
+                return -1.0 # Trả về -1 báo hiệu "Out of Range"
+        
         # B2. Tính khoảng cách trong hệ tọa độ gốc (Dùng Homography Tĩnh)
         pts = np.float32([p_target_static, p_foot_static]).reshape(-1, 1, 2)
         world_pts = cv2.perspectiveTransform(pts, self.matrix_homography_static)
         
         dx = world_pts[0][0][0] - world_pts[1][0][0]
         dy = world_pts[0][0][1] - world_pts[1][0][1]
+        if abs(dx) > 10000 or abs(dy) > 10000: return -1.0 # Fallback nếu có lỗi tính toán
         dist_px = math.sqrt(dx*dx + dy*dy)
         
         return dist_px / self.scale_px_per_meter
@@ -251,21 +275,45 @@ class VideoDistanceApp:
                      roi_trans = cv2.perspectiveTransform(roi_arr, self.M_curr)
                      cv2.polylines(display, [np.int32(roi_trans)], True, (0, 100, 255), 1)
 
-                for obj in self.latest_detections:
+                for i, obj in enumerate(self.latest_detections):
                     foot_curr = obj['ground_point']
                     box = obj['box']
                     
                     # 4. MEASUREMENT (Đo)
                     # Input: Target Gốc & Chân Hiện tại
-                    dist = self.calculate_distance_final(self.target_point_static, foot_curr)
+                    raw_dist = self.calculate_distance_final(self.target_point_static, foot_curr)
                     
-                    # Vẽ vời
-                    cv2.rectangle(display, (box[0], box[1]), (box[2], box[3]), (0,255,255), 1)
+                    final_dist = 0.0
+                    if raw_dist > 0:
+                        # Lưu vào history (dùng index i làm ID tạm thời, tốt hơn nên dùng tracker ID của YOLO)
+                        if i not in self.distance_history: self.distance_history[i] = []
+                        self.distance_history[i].append(raw_dist)
+                        
+                        # Giữ lại 5 frame gần nhất
+                        if len(self.distance_history[i]) > self.MAX_HISTORY:
+                            self.distance_history[i].pop(0)
+                        
+                        # Lấy trung bình
+                        final_dist = sum(self.distance_history[i]) / len(self.distance_history[i])
+                    else:
+                        # Nếu raw_dist lỗi (-1), reset history hoặc dùng giá trị cũ
+                        final_dist = -1
+                    
+                    # Vẽ kết quả
+                    color = (0,255,255)
+                    label = f"{final_dist:.2f}m"
+                    
+                    if final_dist == -1:
+                        label = "N/A (Out of ROI)"
+                        color = (0,0,255) # Màu đỏ báo động
+                    
+                    cv2.rectangle(display, (box[0], box[1]), (box[2], box[3]), color, 1)
                     cv2.circle(display, foot_curr, 5, (0,255,0), -1)
-                    if target_vis:
-                        cv2.line(display, target_vis, foot_curr, (0,255,255), 2)
+                    
+                    if target_vis and final_dist != -1:
+                        cv2.line(display, target_vis, foot_curr, color, 2)
                         mid = ((target_vis[0]+foot_curr[0])//2, (target_vis[1]+foot_curr[1])//2)
-                        cv2.putText(display, f"{dist:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                        cv2.putText(display, label, mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
             # ... (Các bước SELECT_ROI vẽ tĩnh) ...
             if self.step == "SELECT_ROI":
