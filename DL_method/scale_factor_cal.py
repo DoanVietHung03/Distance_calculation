@@ -8,11 +8,11 @@ from PIL import Image
 
 # ================= CẤU HÌNH NGƯỜI DÙNG =================
 # FILE ẢNH CẦN TEST
-IMAGE_SOURCE = "..\\test_imgs\\cam_2\\cam_2_near.jpg"  # Đường dẫn file ảnh
+IMAGE_SOURCE = "..\\test_imgs\\cam_2\\frame_test.jpg"  # Đường dẫn file ảnh
 
 # NHẬP KHOẢNG CÁCH THỰC TẾ BẠN ĐÃ ĐO ĐƯỢC VÀO ĐÂY (Mét)
-# Ví dụ: Từ camera đến chỗ người đứng là 18.5 mét
-REAL_DISTANCE_METERS = 6.0 
+# Từ camera đến chỗ người đứng
+REAL_DISTANCE_METERS = 15.3 
 
 # Cấu hình Model
 # Lưu ý: Với người ở xa, model 'Base' sẽ chính xác hơn 'Small'
