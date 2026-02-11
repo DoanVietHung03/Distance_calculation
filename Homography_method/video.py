@@ -270,7 +270,7 @@ class VideoDistanceApp:
 
         # Chỉ chạy YOLO mỗi N frames để tối ưu, nhưng vẫn giữ box cũ
         if self.frame_count % YOLO_SKIP_FRAMES == 0:
-            results = self.yolo_model(img, verbose=False, device=self.device, conf=0.6, imgsz=640)
+            results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
             self.detected_objects = []
             self.last_known_boxes = [] # Reset box cũ
             
@@ -291,7 +291,7 @@ class VideoDistanceApp:
                     if kpts_data is not None and len(kpts_data) > i:
                         kp = kpts_data[i]
                         if kp[15][2] > 0.5 and kp[16][2] > 0.5:
-                            ground_point = (int((kp[15][0]+kp[16][0])/2), int((kp[15][1]+kp[16][1])/2))
+                            ground_point = (int((kp[15][0]+kp[16][0])/2), int((kp[15][1]+kp[16][1]+5)/2))
                         if kp[0][2] > 0.5:
                             head_point = (int(kp[0][0]), int(kp[0][1]))
 
@@ -442,3 +442,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+# 1. Điểm nghẽn nghiêm trọng nhất: Thứ tự Undistort và Resize
+# Hiện tại: Bạn đang gọi cv2.remap (khử méo) trên frame gốc (Full HD hoặc 4K) trước khi resize về 1200px.
+
+# Vấn đề: cv2.remap là một phép toán cực nặng (tính toán lại từng pixel). Làm việc này trên ảnh 4K tốn gấp 4-8 lần so với ảnh 1200px.
+
+# Giải pháp: Resize ảnh gốc trước -> Sau đó mới Remap. Bạn cần scale lại Ma trận Camera (K) tương ứng với tỷ lệ resize.
