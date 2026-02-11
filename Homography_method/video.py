@@ -6,7 +6,7 @@ import json
 import time
 from ultralytics import YOLO
 import torch
-
+from threading import Thread
 # IMPORT MODULE CŨ
 from height_estimator import HeightEstimator
 
@@ -16,7 +16,53 @@ CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200 
 YOLO_SKIP_FRAMES = 5
+class VideoStream:
+    def __init__(self, src=0):
+        self.stream = cv2.VideoCapture(src)
+        self.ret, self.frame = self.stream.read()
+        self.stopped = False
+        
+        # --- FIX TỐC ĐỘ: Lấy FPS gốc của video ---
+        self.fps = self.stream.get(cv2.CAP_PROP_FPS)
+        if self.fps <= 0 or math.isnan(self.fps): self.fps = 30 # Fallback
+        self.delay = 1.0 / self.fps # Tính thời gian delay giữa các frame (giây)
 
+    def start(self):
+        Thread(target=self.update, args=()).start()
+        return self
+
+    def update(self):
+        while True:
+            if self.stopped:
+                self.stream.release()
+                return
+
+            # Đo thời gian bắt đầu đọc
+            start_time = time.time()
+
+            grabbed, frame = self.stream.read()
+            
+            if not grabbed:
+                self.ret = False
+                time.sleep(0.01)
+                continue
+
+            self.ret = True
+            self.frame = frame
+            
+            # --- FIX TỐC ĐỘ: Ngủ một chút để khớp FPS ---
+            # Nếu thread đọc quá nhanh, nó sẽ chờ cho đủ thời gian của 1 frame
+            # Giúp không bị tua nhanh khi đọc từ File
+            elapsed = time.time() - start_time
+            time_to_wait = self.delay - elapsed
+            if time_to_wait > 0:
+                time.sleep(time_to_wait)
+
+    def read(self):
+        return self.ret, self.frame
+
+    def stop(self):
+        self.stopped = True   
 class VideoDistanceApp:
     def __init__(self):
         self.mode = "DISTANCE"
@@ -71,22 +117,55 @@ class VideoDistanceApp:
             self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
         except: pass
 
-    def init_calibration_maps(self, frame_size):
+    def init_calibration_maps(self, original_size):
+        """
+        original_size: (w_orig, h_orig) của video gốc
+        """
         if not os.path.exists(CALIB_FILE): return
         try:
             with open(CALIB_FILE, 'r') as f: data = json.load(f)
+            
             K = np.array(data['camera_matrix'])
             D = np.array(data['distortion_coefficients'])
-            w_curr, h_curr = frame_size
+            
+            w_orig, h_orig = original_size
+            
+            # 1. Tính toán kích thước đích (Target Size)
+            scale_factor = TARGET_W / w_orig
+            target_h = int(h_orig * scale_factor)
+            target_size = (TARGET_W, target_h) # Kích thước sau khi resize
+            
+            # 2. Scale ma trận K cho phù hợp với kích thước đích
+            # Lưu ý: K gốc thường đi kèm với độ phân giải khi calib. 
+            # Nếu video gốc khác size calib, phải scale về video gốc trước, rồi scale tiếp về target.
             if 'image_resolution' in data:
                 calib_w, calib_h = data['image_resolution']
-                if w_curr != calib_w or h_curr != calib_h:
-                    scale_x = w_curr / calib_w; scale_y = h_curr / calib_h
-                    K[0, 0] *= scale_x; K[1, 1] *= scale_y; K[0, 2] *= scale_x; K[1, 2] *= scale_y
-            new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, (w_curr, h_curr), 1, (w_curr, h_curr))
-            self.map1, self.map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, (w_curr, h_curr), 5)
+                # Scale từ Calib -> Video Gốc -> Target
+                total_scale_x = (w_orig / calib_w) * scale_factor
+                total_scale_y = (h_orig / calib_h) * scale_factor
+                
+                K[0, 0] *= total_scale_x
+                K[1, 1] *= total_scale_y
+                K[0, 2] *= total_scale_x
+                K[1, 2] *= total_scale_y
+            else:
+                # Nếu không có info resolution gốc, assume K khớp video gốc, chỉ scale theo target
+                K[0, 0] *= scale_factor; K[1, 1] *= scale_factor
+                K[0, 2] *= scale_factor; K[1, 2] *= scale_factor
+
+            # 3. Tạo Map cho kích thước ĐÍCH (nhỏ)
+            # new_K cũng phải dựa trên target_size
+            new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, target_size, 1, target_size)
+            self.map1, self.map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, target_size, 5)
+            
+            # Load focal length cũng phải theo scale này
             self.height_tool.load_focal_length(CALIB_FILE, TARGET_W)
-        except: pass
+            
+            print(f"[INFO] Optimized Maps created for size: {target_size}")
+
+        except Exception as e:
+            print(f"Error Init Calib: {e}")
+            pass
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return False
@@ -194,30 +273,32 @@ class VideoDistanceApp:
             # --- TỐI ƯU HÓA: Dùng Mask Numpy thay vì vòng lặp for ---
             # Chỉ giữ lại các điểm KHÔNG nằm đè lên người
             if len(self.last_known_boxes) > 0:
-                h_img, w_img = gray_curr.shape
-                # Tạo mask đen (0)
-                mask_boxes = np.zeros((h_img, w_img), dtype=np.uint8)
+                # Chuyển boxes thành numpy array shape (N, 4) -> [x1, y1, x2, y2]
+                boxes_np = np.array(self.last_known_boxes)
                 
-                # Vẽ các box màu trắng (255) lên mask
-                for box in self.last_known_boxes:
-                    x1, y1, x2, y2 = box
-                    # Mở rộng pad 10px như logic cũ
-                    cv2.rectangle(mask_boxes, (max(0, x1-10), max(0, y1-10)), (min(w_img, x2+10), min(h_img, y2+10)), 255, -1)
+                # Mở rộng box ra 10px như logic cũ
+                x1 = boxes_np[:, 0] - 10
+                y1 = boxes_np[:, 1] - 10
+                x2 = boxes_np[:, 2] + 10
+                y2 = boxes_np[:, 3] + 10
                 
-                # Chuyển tọa độ điểm thành số nguyên để index matrix
-                pts_int = good_new.astype(int)
+                # good_new có shape (M, 2) -> toạ độ x, y
+                pts_x = good_new[:, 0]
+                pts_y = good_new[:, 1]
                 
-                # Clip tọa độ để không bị lỗi index out of bounds
-                pts_int[:, 0] = np.clip(pts_int[:, 0], 0, w_img - 1)
-                pts_int[:, 1] = np.clip(pts_int[:, 1], 0, h_img - 1)
+                # Broadcasting để so sánh tất cả điểm với tất cả box cùng lúc
+                # Kết quả là ma trận (M, N): Điểm M có nằm trong Box N không?
+                # x >= x1 và x <= x2 và y >= y1 và y <= y2
+                in_x_range = (pts_x[:, None] >= x1) & (pts_x[:, None] <= x2)
+                in_y_range = (pts_y[:, None] >= y1) & (pts_y[:, None] <= y2)
+                in_box = in_x_range & in_y_range
                 
-                # Kiểm tra điểm nào rơi vào vùng màu trắng (255)
-                # mask_boxes[y, x] > 0
-                is_on_person = mask_boxes[pts_int[:, 1], pts_int[:, 0]] > 0
+                # Điểm được coi là "bẩn" nếu nó nằm trong BẤT KỲ box nào (any axis 1)
+                is_dirty_point = np.any(in_box, axis=1)
                 
-                # Giữ lại điểm KHÔNG nằm trên người (~is_on_person)
-                clean_new = good_new[~is_on_person]
-                clean_old = good_old[~is_on_person]
+                # Giữ lại điểm sạch (~is_dirty)
+                clean_new = good_new[~is_dirty_point]
+                clean_old = good_old[~is_dirty_point]
             else:
                 clean_new = good_new
                 clean_old = good_old
@@ -315,16 +396,19 @@ class VideoDistanceApp:
         curr_time = time.time()
         self.fps = 1 / (curr_time - self.prev_time) if self.prev_time > 0 else 0
         self.prev_time = curr_time
-
-        if self.map1 is not None:
-            frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
-        else: frame = raw_frame
         
-        h, w = frame.shape[:2]
+        h, w = raw_frame.shape[:2]
         scale = TARGET_W / w
         new_h = int(h * scale)
-        frame_resized = cv2.resize(frame, (TARGET_W, new_h))
-        frame_gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+        frame_resized = cv2.resize(raw_frame, (TARGET_W, new_h))
+        
+        if self.map1 is not None:
+            # Map1, Map2 bây giờ đã khớp với kích thước 1200px
+            frame_clean = cv2.remap(frame_resized, self.map1, self.map2, cv2.INTER_LINEAR)
+        else:
+            frame_clean = frame_resized
+            
+        frame_gray = cv2.cvtColor(frame_clean, cv2.COLOR_BGR2GRAY)
 
         # 1. Chạy Detect trước để lấy Bounding Box (cho Stabilizer né)
         # Lưu ý: Logic cũ chạy detect sau, nhưng giờ ta cần vị trí người TRƯỚC khi tính flow
@@ -338,13 +422,13 @@ class VideoDistanceApp:
         else:
             self.update_stabilizer(frame_gray)
             
-        target_box = self.update_target_tracker(frame_resized)
+        target_box = self.update_target_tracker(frame_clean)
         
         # 3. Detect object (Cập nhật box mới cho vòng lặp sau)
-        self.detect_objects_and_update_boxes(frame_resized)
+        self.detect_objects_and_update_boxes(frame_clean)
         
         self.frame_count += 1
-        return frame_resized, target_box
+        return frame_clean, target_box
 
     def draw_overlays(self, img, target_box):
         cv2.putText(img, f"FPS: {int(self.fps)}", (TARGET_W - 120, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -403,11 +487,11 @@ def mouse_event_video(event, x, y, flags, param):
             except: pass
 
 def main():
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened(): return
+    vs = VideoStream(VIDEO_PATH).start()
+    time.sleep(1.0)
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(vs.stream.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vs.stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
     app.init_calibration_maps((width, height))
     app.load_config()
 
@@ -416,37 +500,38 @@ def main():
 
     while True:
         if not app.paused:
-            ret, frame = cap.read()
+            ret, frame = vs.read()
             if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                print("End of video, resetting...")
+                vs.stream.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 # Khi loop video, phải reset Anchor vì cảnh quay lại từ đầu
                 app.gray_anchor = None 
+                time.sleep(0.5)
                 continue
             app.current_frame, target_box = app.process_frame(frame)
         else:
             target_box = None
+            if app.current_frame is None: 
+                ret, frame = vs.read()
+                if ret:
+                    app.current_frame, target_box = app.process_frame(frame)
 
-        display_img = app.current_frame.copy()
-        app.draw_overlays(display_img, target_box)
-        cv2.imshow("Anchor Tracking", display_img)
+        if app.current_frame is not None:
+            display_img = app.current_frame.copy()
+            app.draw_overlays(display_img, target_box)
+            cv2.imshow("Anchor Tracking", display_img)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'): break
+        if key == ord('q'):
+            vs.stop()
+            break
         if key == ord(' '): app.paused = not app.paused
         if app.paused:
             if key == ord('h'): app.mode = "HEIGHT"
             if key == ord('d'): app.mode = "DISTANCE"
 
-    cap.release()
     cv2.destroyAllWindows()
+    vs.stop()
 
 if __name__ == "__main__":
     main()
-    
-    
-# 1. Điểm nghẽn nghiêm trọng nhất: Thứ tự Undistort và Resize
-# Hiện tại: Bạn đang gọi cv2.remap (khử méo) trên frame gốc (Full HD hoặc 4K) trước khi resize về 1200px.
-
-# Vấn đề: cv2.remap là một phép toán cực nặng (tính toán lại từng pixel). Làm việc này trên ảnh 4K tốn gấp 4-8 lần so với ảnh 1200px.
-
-# Giải pháp: Resize ảnh gốc trước -> Sau đó mới Remap. Bạn cần scale lại Ma trận Camera (K) tương ứng với tỷ lệ resize.
