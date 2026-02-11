@@ -6,22 +6,28 @@ from PIL import Image
 import threading
 import queue
 import time
+from ultralytics import YOLO
 
 # ================= CẤU HÌNH NGƯỜI DÙNG =================
-VIDEO_PATH = "..\\test_imgs\\cam_2\\cam_2.mp4"  # <--- ĐỔI ĐƯỜNG DẪN FILE VIDEO CỦA BẠN
+VIDEO_PATH = "..\\test_imgs\\cam_2\\cam_2.mp4" 
 
-# 1. HỆ SỐ SCALE (Lấy từ bước Calibrate)
-SCALE_FACTOR = 12.72 
+# 1. HỆ SỐ SCALE
+SCALE_FACTOR = 11.06 
 
-# 2. CẤU HÌNH HIỂN THỊ (RESIZE)
-DISPLAY_WIDTH = 1200  # Giảm xuống nếu video giật lag
+# 2. CẤU HÌNH HIỂN THỊ
+DISPLAY_WIDTH = 800  
 
-# 3. THÔNG SỐ CAMERA (PINHOLE)
-# Nếu không biết, để None code tự ước lượng
+# 3. THÔNG SỐ CAMERA
 FOCAL_LENGTH = 1600 
 
 # Model AI
 DEPTH_MODEL_REPO = "depth-anything/Depth-Anything-V2-Small-hf"
+YOLO_MODEL_PATH = "..\\weights\\yolo11n.onnx"
+
+# Performance tuning
+DEPTH_INPUT_WIDTH = 640        
+DEPTH_SKIP = 2                 
+DETECT_SKIP = 3                # Tăng nhẹ skip detection để ưu tiên FPS hiển thị
 # ========================================================
 
 class Measure3DVideoTool:
@@ -29,7 +35,7 @@ class Measure3DVideoTool:
         self.device = 0 if torch.cuda.is_available() else -1
         print(f"[Init] Đang load model trên {'GPU' if self.device==0 else 'CPU'}...")
         
-        # Load Model
+        # Load Depth Model
         self.pipe = pipeline(task="depth-estimation", model=DEPTH_MODEL_REPO, device=self.device)
         
         # Load Video
@@ -38,19 +44,18 @@ class Measure3DVideoTool:
             print(f"[ERR] Không mở được video: {VIDEO_PATH}")
             exit()
 
-        # Lấy thông số video gốc
+        # Thông số video
         self.org_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.org_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # --- XỬ LÝ RESIZE ---
-        # Tính tỉ lệ resize để hiển thị
+        # Resize hiển thị
         self.scale_ratio = DISPLAY_WIDTH / self.org_w
         self.new_h = int(self.org_h * self.scale_ratio)
         self.new_w = DISPLAY_WIDTH
         
         print(f"[Info] Video gốc: {self.org_w}x{self.org_h} -> Hiển thị: {self.new_w}x{self.new_h}")
         
-        # Cập nhật thông số Pinhole theo kích thước hiển thị (new_w, new_h)
+        # Camera Params
         self.cx = self.new_w / 2
         self.cy = self.new_h / 2
         
@@ -62,181 +67,252 @@ class Measure3DVideoTool:
             self.fy = FOCAL_LENGTH * self.scale_ratio
             
         self.depth_map = None
-        self.current_frame_display = None # Lưu frame hiện tại để vẽ UI
-        self.points = [] # Danh sách điểm click
-        self.is_paused = False # Trạng thái Pause
-        # Threading/queue for background depth computation
-        self.frame_queue = queue.Queue(maxsize=1)
+        self.current_frame_display = None 
+        self.points = [] 
+        self.target = None 
+        self.is_paused = False 
+
+        # YOLO Config
+        self.YOLO_MODEL_PATH = YOLO_MODEL_PATH
+        self.YOLO_INPUT_SIZE = 640
+        self.YOLO_CONF_THRES = 0.35
+        self.yolo_model = None
+        try:
+            self.yolo_model = YOLO(self.YOLO_MODEL_PATH, task='detect') 
+            print(f"[Info] Loaded YOLO model: {self.YOLO_MODEL_PATH}")
+        except Exception as e:
+            print(f"[Warn] Lỗi load YOLO: {e}")
+
+        # Threading Setup
         self.stop_event = threading.Event()
-        self.depth_thread = threading.Thread(target=self.depth_worker, daemon=True)
-        self.depth_thread.start()
+        
+        self.frame_queue = queue.Queue(maxsize=1) # Queue cho Depth
+        self.detect_queue = queue.Queue(maxsize=1) # Queue cho YOLO
+        
+        self.persons = [] # Kết quả detect được chia sẻ
+
+        # Start Threads
+        threading.Thread(target=self.depth_worker, daemon=True).start()
+        threading.Thread(target=self.detect_worker, daemon=True).start()
+
+        # Depth input size
+        self.depth_w = min(self.new_w, DEPTH_INPUT_WIDTH)
+        self.depth_h = max(1, int(self.new_h * (self.depth_w / float(self.new_w))))
+        self.frame_idx = 0
+
+    def push_to_queue(self, q, data):
+        """Hàm phụ trợ: Đẩy data vào queue, nếu đầy thì xóa cái cũ nhất"""
+        try:
+            q.put_nowait(data)
+        except queue.Full:
+            try:
+                q.get_nowait() # Vứt bỏ frame cũ
+                q.put_nowait(data) # Nhét frame mới
+            except:
+                pass
 
     def process_depth_frame(self, frame_bgr):
-        """Tính Depth Map cho 1 frame"""
-        # Resize frame trước khi đưa vào model để đồng bộ với hiển thị và tăng tốc độ
-        frame_resized = cv2.resize(frame_bgr, (self.new_w, self.new_h))
-        
-        # Chuyển sang PIL
-        img_pil = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
-        
-        # Inference
-        depth_output = self.pipe(img_pil)
-        depth_tensor = depth_output["predicted_depth"]
-        depth_map_raw = depth_tensor.squeeze().cpu().numpy()
-        
-        # Resize lại depth map cho chắc chắn khớp 100% kích thước hiển thị
-        self.depth_map = cv2.resize(depth_map_raw, (self.new_w, self.new_h), interpolation=cv2.INTER_LINEAR)
-        self.current_frame_display = frame_resized
+        try:
+            frame_small = cv2.resize(frame_bgr, (self.depth_w, self.depth_h))
+            img_pil = Image.fromarray(cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB))
+            
+            depth_output = self.pipe(img_pil)
+            depth_tensor = depth_output["predicted_depth"]
+            depth_map_raw = depth_tensor.squeeze().cpu().numpy()
+
+            # Resize lại khớp với màn hình hiển thị
+            self.depth_map = cv2.resize(depth_map_raw, (self.new_w, self.new_h), interpolation=cv2.INTER_LINEAR)
+        except Exception as e:
+            print(f"[Depth Err] {e}")
 
     def depth_worker(self):
-        """Background worker that consumes frames and computes depth."""
         while not self.stop_event.is_set():
             try:
                 frame = self.frame_queue.get(timeout=0.2)
+                self.process_depth_frame(frame)
             except queue.Empty:
                 continue
 
+    def detect_worker(self):
+        while not self.stop_event.is_set():
             try:
-                self.process_depth_frame(frame)
-            except Exception as e:
-                print(f"[Worker ERR] {e}")
-            finally:
-                try:
-                    self.frame_queue.task_done()
-                except Exception:
-                    pass
+                # frame này đã được resize về 640x640 ở main thread
+                frame_small = self.detect_queue.get(timeout=0.2)
+                self.persons = self.detect_persons(frame_small)
+            except queue.Empty:
+                continue
+
+    def detect_persons(self, frame_sq):
+        """Input frame_sq là ảnh vuông 640x640"""
+        out = []
+        if self.yolo_model is None or self.depth_map is None:
+            return out
+        
+        ih, iw = frame_sq.shape[:2] # 640, 640
+
+        results = self.yolo_model(frame_sq, imgsz=self.YOLO_INPUT_SIZE, verbose=False)[0]
+
+        if len(results.boxes) == 0:
+            return out
+
+        # Tính tỉ lệ để map từ 640x640 về màn hình hiển thị (new_w x new_h)
+        sx = self.new_w / float(iw)
+        sy = self.new_h / float(ih)
+
+        boxes = results.boxes.xyxy.cpu().numpy()
+        confs = results.boxes.conf.cpu().numpy()
+        clss = results.boxes.cls.cpu().numpy()
+
+        dh, dw = self.depth_map.shape[:2]
+
+        for i, box in enumerate(boxes):
+            if confs[i] < self.YOLO_CONF_THRES or int(clss[i]) != 0: # 0 is person
+                continue
+
+            x1, y1, x2, y2 = box
+            # Map tọa độ về màn hình hiển thị
+            x = int(x1 * sx)
+            y = int(y1 * sy)
+            w = int((x2 - x1) * sx)
+            h = int((y2 - y1) * sy)
+
+            # Foot point
+            foot_x = int(x + w / 2)
+            foot_y = int(y + h)
+
+            # Clip coordinates
+            foot_x = max(0, min(foot_x, dw - 1))
+            foot_y = max(0, min(foot_y, dh - 1))
+
+            # Lấy depth
+            patch = self.depth_map[max(0, foot_y-2):min(dh, foot_y+3), max(0, foot_x-2):min(dw, foot_x+3)]
+            if patch.size == 0: continue
+            
+            raw_val = float(np.median(patch))
+            c3d = self.pixel_to_3d(foot_x, foot_y, raw_val)
+
+            out.append({
+                'box': (x, y, w, h),
+                'foot_px': (foot_x, foot_y),
+                'c3d': c3d,
+                'conf': confs[i]
+            })
+        return out
 
     def pixel_to_3d(self, u, v, raw_depth_val):
-        """Chuyển đổi Pixel (u,v) + Depth -> Tọa độ 3D (X, Y, Z)"""
         if raw_depth_val <= 0: return None
-        
-        # 1. Tính Z (Mét)
         Z = SCALE_FACTOR / raw_depth_val
-        
-        # 2. Tính X, Y (Mét) dùng công thức Pinhole
         X = (u - self.cx) * Z / self.fx
         Y = (v - self.cy) * Z / self.fy
-        
         return np.array([X, Y, Z])
+
+    def draw_and_show(self):
+        if self.current_frame_display is None: return
+        img = self.current_frame_display.copy()
+
+        # Status
+        status = "PAUSED" if self.is_paused else "PLAYING"
+        cv2.putText(img, f"{status} | FPS: Uncapped", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Draw Points
+        for i, (px, py, _) in enumerate(self.points):
+            # Update 3D realtime
+            d_val = self.depth_map[py, px] if self.depth_map is not None else 1
+            curr_c3d = self.pixel_to_3d(px, py, d_val)
+            self.points[i] = (px, py, curr_c3d) # Update lại list
+
+            cv2.circle(img, (px, py), 5, (0,0,255), -1)
+            cv2.putText(img, f"P{i+1}", (px+10, py), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+        # Draw Target
+        if self.target:
+            tx, ty, _ = self.target
+            # Update target depth realtime as well (optional, tuỳ bài toán, ở đây giữ cố định vị trí pixel)
+            if self.depth_map is not None:
+                d_val_t = self.depth_map[ty, tx]
+                self.target = (tx, ty, self.pixel_to_3d(tx, ty, d_val_t))
+            
+            cv2.circle(img, (tx, ty), 6, (0,255,255), -1)
+            cv2.putText(img, "Target", (tx+8, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+
+        # Draw Persons & Distance
+        if self.persons:
+            # Person 0 (người đầu tiên detect được)
+            p = self.persons[0]
+            x, y, w, h = p['box']
+            fx, fy = p['foot_px']
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.circle(img, (fx, fy), 5, (0, 255, 0), -1)
+
+            # Line to Target
+            if self.target and self.target[2] is not None and p['c3d'] is not None:
+                dist = np.linalg.norm(p['c3d'] - self.target[2])
+                cv2.line(img, (fx, fy), (self.target[0], self.target[1]), (255,255,0), 2)
+                mid = ((fx + self.target[0])//2, (fy + self.target[1])//2)
+                cv2.putText(img, f"{dist:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+
+        # Distance between 2 manual points
+        if len(self.points) >= 2:
+            p1, p2 = self.points[-2], self.points[-1]
+            if p1[2] is not None and p2[2] is not None:
+                d = np.linalg.norm(p1[2] - p2[2])
+                cv2.line(img, (p1[0], p1[1]), (p2[0], p2[1]), (0,255,255), 2)
+                mid = ((p1[0] + p2[0])//2, (p1[1] + p2[1])//2)
+                cv2.putText(img, f"{d:.2f}m", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+        cv2.imshow("Measure 3D", img)
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             if self.depth_map is None: return
-
-            # Lấy giá trị depth tại thời điểm click
-            raw_val = self.depth_map[y, x]
-            coord_3d = self.pixel_to_3d(x, y, raw_val)
-            
-            if coord_3d is not None:
-                self.points.append((x, y, coord_3d))
-                print(f"Click [{len(self.points)}]: Pixel({x},{y}) -> DepthVal: {raw_val:.2f} -> Z: {coord_3d[2]:.2f}m")
+            val = self.depth_map[y, x]
+            c3d = self.pixel_to_3d(x, y, val)
+            self.target = (x, y, c3d)
+            # Nếu muốn đo điểm nối điểm thay vì target, uncomment dòng dưới:
+            # self.points.append((x, y, c3d)) 
 
         elif event == cv2.EVENT_RBUTTONDOWN:
-            # Chuột phải để Reset
+            self.target = None
             self.points = []
-            print("[Reset] Đã xóa các điểm đo.")
-
-    def draw_and_show(self):
-        if self.current_frame_display is None: return
-
-        img_display = self.current_frame_display.copy()
-        
-        # Hiển thị trạng thái PAUSE
-        if self.is_paused:
-            cv2.putText(img_display, "PAUSED (Click to Measure)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        else:
-            cv2.putText(img_display, "PLAYING (Press Space to Pause)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        # Vẽ các điểm đã click
-        # Lưu ý: Với Video, các điểm này ghim theo tọa độ màn hình (pixel). 
-        # Nếu camera di chuyển, vị trí thực tế sẽ thay đổi, nhưng code này đang đo realtime theo pixel đó.
-        for i, (px, py, old_c3d) in enumerate(self.points):
-            # Cập nhật lại Z theo frame hiện tại (nếu muốn realtime distance khi video chạy)
-            # Hoặc giữ nguyên giá trị lúc click (ở đây ta tính lại theo frame hiện tại để thấy khoảng cách thay đổi)
-            curr_depth_val = self.depth_map[py, px]
-            curr_c3d = self.pixel_to_3d(px, py, curr_depth_val)
-            
-            # Cập nhật lại giá trị 3D trong list points (để tính khoảng cách mới)
-            self.points[i] = (px, py, curr_c3d)
-
-            color = (0, 0, 255) if i == 0 else (255, 0, 0)
-            cv2.circle(img_display, (px, py), 5, color, -1)
-            cv2.putText(img_display, f"P{i+1}", (px+10, py), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-        # Tính khoảng cách giữa 2 điểm cuối
-        if len(self.points) >= 2:
-            p1 = self.points[-2]
-            p2 = self.points[-1]
-            
-            xyz1 = p1[2]
-            xyz2 = p2[2]
-            
-            dist_3d = np.linalg.norm(xyz1 - xyz2)
-            
-            cv2.line(img_display, (p1[0], p1[1]), (p2[0], p2[1]), (0, 255, 255), 2)
-            
-            mid_x = (p1[0] + p2[0]) // 2
-            mid_y = (p1[1] + p2[1]) // 2
-            
-            label = f"{dist_3d:.2f}m"
-            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-            cv2.rectangle(img_display, (mid_x, mid_y - h - 5), (mid_x + w, mid_y + 5), (0, 0, 0), -1)
-            cv2.putText(img_display, label, (mid_x, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-        cv2.imshow("Measure 3D Video", img_display)
 
     def run(self):
-        cv2.namedWindow("Measure 3D Video")
-        cv2.setMouseCallback("Measure 3D Video", self.mouse_callback)
+        cv2.namedWindow("Measure 3D")
+        cv2.setMouseCallback("Measure 3D", self.mouse_callback)
         
-        print("\n--- HƯỚNG DẪN ---")
-        print("1. SPACE: Tạm dừng / Tiếp tục video")
-        print("2. Chuột TRÁI: Chọn điểm đo")
-        print("3. Chuột PHẢI: Xóa điểm")
-        print("4. 'q': Thoát")
+        print("Ready. Press Space to Pause/Play, Q to Quit.")
 
         while True:
-            # Nếu KHÔNG PAUSE thì đọc frame mới và xử lý
             if not self.is_paused:
                 ret, frame = self.cap.read()
                 if not ret:
-                    print("Hết video hoặc lỗi đọc frame. Loop lại từ đầu...")
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                # Enqueue frame for background depth computation.
-                # If the queue is full, replace the previous frame (drop-old behavior).
-                try:
-                    self.frame_queue.put_nowait(frame)
-                except queue.Full:
-                    try:
-                        # remove old frame and put the new one
-                        _ = self.frame_queue.get_nowait()
-                        self.frame_queue.task_done()
-                    except Exception:
-                        pass
-                    try:
-                        self.frame_queue.put_nowait(frame)
-                    except Exception:
-                        pass
-            
-            # Vẽ giao diện (dù pause hay play đều vẽ lại để hiển thị điểm click)
+                
+                self.frame_idx += 1
+                
+                # Resize hiển thị (làm 1 lần)
+                display_frame = cv2.resize(frame, (self.new_w, self.new_h))
+                self.current_frame_display = display_frame
+
+                # 1. Depth Worker (Gửi frame gốc hoặc frame nhỏ tùy ý, ở đây gửi frame gốc)
+                # Tốt nhất là resize trước khi gửi queue để worker đỡ việc, nhưng code cũ bạn gửi frame gốc cũng OK
+                if self.frame_idx % DEPTH_SKIP == 0:
+                    self.push_to_queue(self.frame_queue, frame)
+
+                # 2. YOLO Worker (QUAN TRỌNG: Chỉ resize khi cần)
+                if self.frame_idx % DETECT_SKIP == 0:
+                    # Resize ở đây để tiết kiệm CPU cho các frame bị skip
+                    small_frame = cv2.resize(frame, (self.YOLO_INPUT_SIZE, self.YOLO_INPUT_SIZE))
+                    self.push_to_queue(self.detect_queue, small_frame)
+
             self.draw_and_show()
             
             key = cv2.waitKey(1 if not self.is_paused else 30)
-            
-            if key == ord('q'):
-                break
-            elif key == ord(' '): # Phím Space
-                self.is_paused = not self.is_paused
-                state = "PAUSED" if self.is_paused else "PLAYING"
-                print(f"--- {state} ---")
+            if key == ord('q'): break
+            if key == ord(' '): self.is_paused = not self.is_paused
 
-        # signal worker to stop and wait
         self.stop_event.set()
-        self.depth_thread.join(timeout=1.0)
-        self.cap.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    tool = Measure3DVideoTool()
-    tool.run()
+    Measure3DVideoTool().run()
