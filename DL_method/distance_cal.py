@@ -15,7 +15,7 @@ VIDEO_PATH = "..\\test_imgs\\cam_2\\cam_2.mp4"
 SCALE_FACTOR = 11.06 
 
 # 2. CẤU HÌNH HIỂN THỊ
-DISPLAY_WIDTH = 800  
+DISPLAY_WIDTH = 1200  
 
 # 3. THÔNG SỐ CAMERA
 FOCAL_LENGTH = 1600 
@@ -27,7 +27,7 @@ YOLO_MODEL_PATH = "..\\weights\\yolo11n.onnx"
 # Performance tuning
 DEPTH_INPUT_WIDTH = 640        
 DEPTH_SKIP = 2                 
-DETECT_SKIP = 3                # Tăng nhẹ skip detection để ưu tiên FPS hiển thị
+DETECT_SKIP = 5                # Tăng nhẹ skip detection để ưu tiên FPS hiển thị
 # ========================================================
 
 class Measure3DVideoTool:
@@ -43,6 +43,14 @@ class Measure3DVideoTool:
         if not self.cap.isOpened():
             print(f"[ERR] Không mở được video: {VIDEO_PATH}")
             exit()
+            
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.fps <= 0 or np.isnan(self.fps): 
+            self.fps = 30 # Fallback nếu không đọc được
+        
+        # Thời gian chờ lý thuyết cho mỗi frame (ms)
+        self.frame_duration_ms = int(1000 / self.fps)
+        print(f"[Info] Video FPS: {self.fps} -> Frame duration: {self.frame_duration_ms}ms")
 
         # Thông số video
         self.org_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -108,8 +116,8 @@ class Measure3DVideoTool:
             try:
                 q.get_nowait() # Vứt bỏ frame cũ
                 q.put_nowait(data) # Nhét frame mới
-            except:
-                pass
+            except Exception as e:
+                print(f"[Queue Err] {e}")
 
     def process_depth_frame(self, frame_bgr):
         try:
@@ -206,13 +214,13 @@ class Measure3DVideoTool:
         Y = (v - self.cy) * Z / self.fy
         return np.array([X, Y, Z])
 
-    def draw_and_show(self):
+    def draw_and_show(self):  # sourcery skip: extract-method
         if self.current_frame_display is None: return
         img = self.current_frame_display.copy()
 
         # Status
         status = "PAUSED" if self.is_paused else "PLAYING"
-        cv2.putText(img, f"{status} | FPS: Uncapped", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(img, f"{status} | FPS: {int(self.fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         # Draw Points
         for i, (px, py, _) in enumerate(self.points):
@@ -278,18 +286,19 @@ class Measure3DVideoTool:
     def run(self):
         cv2.namedWindow("Measure 3D")
         cv2.setMouseCallback("Measure 3D", self.mouse_callback)
-        
+
         print("Ready. Press Space to Pause/Play, Q to Quit.")
 
         while True:
+            start_time = time.time()
             if not self.is_paused:
                 ret, frame = self.cap.read()
                 if not ret:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                
+
                 self.frame_idx += 1
-                
+
                 # Resize hiển thị (làm 1 lần)
                 display_frame = cv2.resize(frame, (self.new_w, self.new_h))
                 self.current_frame_display = display_frame
@@ -306,8 +315,14 @@ class Measure3DVideoTool:
                     self.push_to_queue(self.detect_queue, small_frame)
 
             self.draw_and_show()
-            
-            key = cv2.waitKey(1 if not self.is_paused else 30)
+
+            if self.is_paused:
+                wait_ms = 30
+            else:
+                process_time_ms = int((time.time() - start_time) * 1000)
+                wait_ms = max(1, self.frame_duration_ms - process_time_ms)
+
+            key = cv2.waitKey(wait_ms)
             if key == ord('q'): break
             if key == ord(' '): self.is_paused = not self.is_paused
 

@@ -13,7 +13,7 @@ DEPTH_MODEL_REPO = "depth-anything/Depth-Anything-V2-Small-hf"
 YOLO_MODEL_PATH = "..\\weights\\yolo11n.onnx" 
 
 # QUAN TRỌNG: Phải khớp với cấu hình trong distance_cal.py
-PROCESS_WIDTH = 640  
+PROCESS_WIDTH = 1200  
 # ========================================================
 
 class DepthEstimator:
@@ -23,22 +23,21 @@ class DepthEstimator:
 
     def predict(self, frame_cv2):
         h_org, w_org = frame_cv2.shape[:2]
-        
+
         # 1. Resize input cho giống hệt lúc chạy Video Realtime
         # Tính chiều cao mới giữ nguyên tỷ lệ khung hình
         new_h = int(h_org * (PROCESS_WIDTH / w_org))
         frame_resized = cv2.resize(frame_cv2, (PROCESS_WIDTH, new_h))
-        
+
         # 2. Đưa vào AI xử lý
         image_pil = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
         depth_output = self.pipe(image_pil)
         depth_tensor = depth_output["predicted_depth"]
         depth_map_small = depth_tensor.squeeze().cpu().numpy()
-        
-        # 3. Resize kết quả depth map về lại kích thước gốc để khớp với tọa độ YOLO
-        depth_map_final = cv2.resize(depth_map_small, (w_org, h_org), interpolation=cv2.INTER_LINEAR)
-        
-        return depth_map_final
+
+        return cv2.resize(
+            depth_map_small, (w_org, h_org), interpolation=cv2.INTER_LINEAR
+        )
 
 class SmartDistanceApp:
     def __init__(self):
@@ -49,7 +48,7 @@ class SmartDistanceApp:
         self.depth_engine = DepthEstimator()
         self.yolo_model = YOLO(YOLO_MODEL_PATH)
 
-    def run(self):
+    def run(self):  # sourcery skip: extract-method
         print(f"--- ĐANG CALIBRATE VỚI INPUT WIDTH = {PROCESS_WIDTH} ---")
         
         # Bước 1: Tính Depth (đã bao gồm resize bên trong hàm predict để đồng bộ)
