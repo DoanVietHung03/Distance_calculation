@@ -233,7 +233,7 @@ class Measure3DVideoTool:
         Y = (v - self.cy) * Z / self.fy
         return np.array([X, Y, Z])
 
-    def draw_and_show(self):
+    def draw_and_show(self):  # sourcery skip: extract-method
         # Đo thời gian vẽ và hiển thị (Optional)
         # t0 = time.perf_counter()
         if self.current_frame_display is None: return
