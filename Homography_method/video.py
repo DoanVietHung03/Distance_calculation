@@ -16,6 +16,58 @@ CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
 TARGET_W = 1200 
 YOLO_SKIP_FRAMES = 5
+
+import time
+import torch
+import numpy as np
+
+class LatencyProfiler:
+    def __init__(self):
+        self.records = {
+            "Total": [],
+            "YOLO": [],
+            "Stabilizer": [],
+            "Math_Logic": []
+        }
+        self.timers = {}
+
+    def start(self, name):
+        # Nếu dùng GPU, cần sync để đảm bảo chính xác (dù start ít ảnh hưởng hơn end)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.timers[name] = time.perf_counter()
+
+    def stop(self, name):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize() # QUAN TRỌNG: Chờ GPU chạy xong
+        
+        end_time = time.perf_counter()
+        elapsed = (end_time - self.timers[name]) * 1000 # Đổi sang miliseconds (ms)
+        
+        if name in self.records:
+            self.records[name].append(elapsed)
+
+    def print_report(self):
+        print("\n" + "="*40)
+        print("LATENCY REPORT (Unit: ms)")
+        print("="*40)
+        print(f"{'Component':<15} | {'Mean':<8} | {'Min':<8} | {'Max':<8} | {'P99':<8}")
+        print("-" * 55)
+        
+        for name, values in self.records.items():
+            if not values: continue
+            arr = np.array(values)
+            # Bỏ 5 frame đầu tiên (Warm-up phase) để số liệu chính xác
+            if len(arr) > 5: arr = arr[5:] 
+            
+            mean_v = np.mean(arr)
+            min_v = np.min(arr)
+            max_v = np.max(arr)
+            p99_v = np.percentile(arr, 99) # 99th percentile (trường hợp xấu nhất)
+            
+            print(f"{name:<15} | {mean_v:.2f}     | {min_v:.2f}     | {max_v:.2f}     | {p99_v:.2f}")
+        print("="*40 + "\n")
+        
 class VideoStream:
     def __init__(self, src=0):
         self.stream = cv2.VideoCapture(src)
@@ -65,6 +117,7 @@ class VideoStream:
         self.stopped = True   
 class VideoDistanceApp:
     def __init__(self):
+        self.profiler = LatencyProfiler()
         self.mode = "DISTANCE"
         self.paused = False
         self.frame_count = 0
@@ -346,53 +399,116 @@ class VideoDistanceApp:
         return track_box
 
     def detect_objects_and_update_boxes(self, img):
-        """Hàm này vừa detect YOLO vừa cập nhật box cho Stabilizer né"""
-        if self.yolo_model is None: return
+        """
+        Hàm xử lý logic YOLO, cập nhật Box cho Stabilizer né, 
+        và tính toán Chiều cao/Khoảng cách.
+        Có tích hợp đo độ trễ (Latency Profiling).
+        """
+        if self.yolo_model is None: 
+            return
 
-        # Chỉ chạy YOLO mỗi N frames để tối ưu, nhưng vẫn giữ box cũ
-        if self.frame_count % YOLO_SKIP_FRAMES == 0:
+        # Chỉ chạy YOLO mỗi N frames (Skip logic)
+        should_run_inference = (self.frame_count % YOLO_SKIP_FRAMES == 0)
+
+        if should_run_inference:
+            # --- PHASE 1: INFERENCE (Nặng nhất) ---
+            # Nếu có class Profiler thì đo, không thì thôi (để code đỡ lỗi nếu chưa thêm)
+            if hasattr(self, 'profiler'): self.profiler.start("YOLO")
+            
+            # Chạy inference
+            # verbose=False để đỡ spam console
             results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
+            
+            if hasattr(self, 'profiler'): self.profiler.stop("YOLO")
+
+            # --- PHASE 2: PROCESSING (Logic toán học) ---
+            if hasattr(self, 'profiler'): self.profiler.start("Math_Logic")
+
+            # Reset danh sách vật thể và hộp cấm (cho Stabilizer frame sau)
             self.detected_objects = []
-            self.last_known_boxes = [] # Reset box cũ
+            self.last_known_boxes = [] 
             
             target_pt = self.get_current_target_tuple()
 
             for r in results:
+                # Lấy boxes và keypoints về CPU/Numpy
                 boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-                kpts_data = r.keypoints.data.cpu().numpy() if r.keypoints is not None else None
                 
+                # Check xem model có hỗ trợ Keypoints (Pose) không
+                kpts_data = None
+                if r.keypoints is not None and r.keypoints.data is not None:
+                    kpts_data = r.keypoints.data.cpu().numpy()
+
                 for i, box in enumerate(boxes):
-                    # Lưu box vào danh sách "cấm" cho Stabilizer
+                    # 1. Lưu box để Stabilizer né (Anti-occlusion)
                     self.last_known_boxes.append(box)
                     
                     x1, y1, x2, y2 = box
-                    ground_point = (int((x1+x2)/2), y2)
-                    head_point = (int((x1+x2)/2), y1)
                     
-                    if kpts_data is not None and len(kpts_data) > i:
-                        kp = kpts_data[i]
-                        if kp[15][2] > 0.5 and kp[16][2] > 0.5:
-                            ground_point = (int((kp[15][0]+kp[16][0])/2), int((kp[15][1]+kp[16][1]+5)/2))
-                        if kp[0][2] > 0.5:
-                            head_point = (int(kp[0][0]), int(kp[0][1]))
+                    # 2. Xác định điểm ĐẦU và CHÂN
+                    # Mặc định dùng Bounding Box (Top-Center và Bottom-Center)
+                    head_point = (int((x1 + x2) / 2), y1)
+                    ground_point = (int((x1 + x2) / 2), y2)
 
-                    obj_info = {'box': box, 'head': head_point, 'foot': ground_point, 'h_real': 0.0, 'd_to_target': 0.0}
+                    # Nếu có Keypoints (Pose Model), dùng để chính xác hơn
+                    if kpts_data is not None and len(kpts_data) > i:
+                        kp = kpts_data[i] # Shape: (17, 3) -> [x, y, conf]
+                        
+                        # -- Điểm CHÂN (Midpoint của 2 mắt cá chân: index 15, 16) --
+                        # Kiểm tra độ tin cậy > 0.5
+                        if kp[15][2] > 0.5 and kp[16][2] > 0.5:
+                            gx = (kp[15][0] + kp[16][0]) / 2
+                            gy = (kp[15][1] + kp[16][1]) / 2
+                            ground_point = (int(gx), int(gy))
+                        elif kp[15][2] > 0.5: # Chỉ thấy chân trái
+                            ground_point = (int(kp[15][0]), int(kp[15][1]))
+                        elif kp[16][2] > 0.5: # Chỉ thấy chân phải
+                            ground_point = (int(kp[16][0]), int(kp[16][1]))
+                        
+                        # -- Điểm ĐẦU (Mũi: index 0 hoặc Mắt: 1, 2) --
+                        if kp[0][2] > 0.5: # Mũi
+                            head_point = (int(kp[0][0]), int(kp[0][1]))
+                        elif kp[1][2] > 0.5 and kp[2][2] > 0.5: # Giữa 2 mắt
+                            hx = (kp[1][0] + kp[2][0]) / 2
+                            hy = (kp[1][1] + kp[2][1]) / 2
+                            head_point = (int(hx), int(hy))
+
+                    # 3. Tính toán theo MODE
+                    obj_info = {
+                        'box': box, 
+                        'head': head_point, 
+                        'foot': ground_point, 
+                        'h_real': 0.0, 
+                        'd_to_target': 0.0
+                    }
                     
                     if self.mode == "HEIGHT":
-                        h_real, _ = self.height_tool.calculate(head_point, ground_point, self.matrix_homography, self.cam_real_pos)
+                        # Gọi module tính chiều cao
+                        h_real, _ = self.height_tool.calculate(
+                            head_point, 
+                            ground_point, 
+                            self.matrix_homography, 
+                            self.cam_real_pos
+                        )
                         obj_info['h_real'] = h_real
+                        
                     elif self.mode == "DISTANCE" and target_pt:
+                        # Gọi hàm tính khoảng cách tới điểm target
                         d_target = self.calculate_distance_points(ground_point, target_pt)
                         obj_info['d_to_target'] = d_target
                     
                     self.detected_objects.append(obj_info)
+
+            if hasattr(self, 'profiler'): self.profiler.stop("Math_Logic")
+            
         else:
-            # Nếu skip frame YOLO, ta vẫn cần tính lại khoảng cách cho các object cũ
-            # (Vì camera có thể rung, object vẫn di chuyển trong logic code cũ, 
-            # nhưng ở đây ta chỉ dùng box cũ để né Optical Flow thôi)
+            # OPTIONAL: Nếu đang SKIP frame, bạn có thể giữ nguyên logic cũ 
+            # hoặc update vị trí các vật thể cũ bằng Optical Flow (nâng cao).
+            # Ở mức cơ bản, ta chỉ pass để giữ nguyên self.detected_objects của frame trước.
             pass
 
     def process_frame(self, raw_frame):
+        self.profiler.start("Total")
         curr_time = time.time()
         self.fps = 1 / (curr_time - self.prev_time) if self.prev_time > 0 else 0
         self.prev_time = curr_time
@@ -416,16 +532,20 @@ class VideoDistanceApp:
         # Tốt nhất: Dùng Box của frame TRƯỚC ĐÓ (self.last_known_boxes) để né cho frame NAY.
         # Sai số vị trí người giữa 1 frame (33ms) là không đáng kể.
         
-        # 2. Update Stabilizer (Dùng box của frame cũ hoặc frame detect gần nhất)
+        # 2. Update Stabilizer (Dùng box của frame cũ hoặc frame detect gần nhất) và đo Stabilizer
+        self.profiler.start("Stabilizer")
         if self.gray_anchor is None:
             self.init_anchor(frame_gray)
         else:
             self.update_stabilizer(frame_gray)
+        self.profiler.stop("Stabilizer")
             
         target_box = self.update_target_tracker(frame_clean)
         
         # 3. Detect object (Cập nhật box mới cho vòng lặp sau)
         self.detect_objects_and_update_boxes(frame_clean)
+        
+        self.profiler.stop("Total")
         
         self.frame_count += 1
         return frame_clean, target_box
@@ -523,6 +643,7 @@ def main():
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
+            app.profiler.print_report()
             vs.stop()
             break
         if key == ord(' '): app.paused = not app.paused
