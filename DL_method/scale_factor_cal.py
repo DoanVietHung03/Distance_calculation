@@ -35,6 +35,7 @@ class DepthEstimator:
         depth_tensor = depth_output["predicted_depth"]
         depth_map_small = depth_tensor.squeeze().cpu().numpy()
 
+        # Resize lại về kích thước gốc để khớp tọa độ với ảnh input
         return cv2.resize(
             depth_map_small, (w_org, h_org), interpolation=cv2.INTER_LINEAR
         )
@@ -51,10 +52,12 @@ class SmartDistanceApp:
     def run(self):  # sourcery skip: extract-method
         print(f"--- ĐANG CALIBRATE VỚI INPUT WIDTH = {PROCESS_WIDTH} ---")
         
-        # Bước 1: Tính Depth (đã bao gồm resize bên trong hàm predict để đồng bộ)
+        h_img, w_img = self.frame.shape[:2] # Lấy kích thước ảnh gốc
+
+        # Bước 1: Tính Depth
         depth_map = self.depth_engine.predict(self.frame)
 
-        # Bước 2: Chạy YOLO trên ảnh gốc (YOLO tự resize bên trong nên không lo)
+        # Bước 2: Chạy YOLO
         results = self.yolo_model(self.frame, classes=[0], verbose=False)
 
         # Bước 3: Tính toán
@@ -62,29 +65,39 @@ class SmartDistanceApp:
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 
-                # Lấy giá trị raw từ depth map
-                raw_val = depth_map[cy, cx]
+                # --- SỬA ĐỔI: Lấy điểm chân (Foot Point) thay vì tâm ---
+                foot_x = (x1 + x2) // 2
+                foot_y = y2 
+
+                # An toàn: Kẹp tọa độ trong phạm vi ảnh (tránh lỗi index out of bounds)
+                foot_x = max(0, min(foot_x, w_img - 1))
+                foot_y = max(0, min(foot_y, h_img - 1))
                 
+                # Lấy giá trị raw từ depth map tại điểm CHÂN
+                raw_val = depth_map[foot_y, foot_x]
+                
+                # Tính Scale Factor: S = Z_thuc * d_raw
                 scale_factor = REAL_DISTANCE_METERS * raw_val
                 
-                print(f"\n>> NGƯỜI TẠI ({cx}, {cy})")
-                print(f"   Raw Depth (tại {PROCESS_WIDTH}px input): {raw_val:.4f}")
+                print(f"\n>> NGƯỜI TẠI CHÂN ({foot_x}, {foot_y})")
+                print(f"   Raw Depth tại chân: {raw_val:.4f}")
                 print(f"   Khoảng cách thực: {REAL_DISTANCE_METERS}m")
                 print(f"   >>> SCALE FACTOR CẦN DÙNG: {scale_factor:.2f}")
                 
+                # Vẽ hình minh họa
                 cv2.rectangle(self.frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Vẽ điểm chân để kiểm tra
+                cv2.circle(self.frame, (foot_x, foot_y), 5, (0, 0, 255), -1) 
                 cv2.putText(self.frame, f"Scale: {scale_factor:.2f}", (x1, y1-10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 found = True
 
         if found:
-            # Resize hiển thị cho vừa màn hình (Cái này KHÔNG ảnh hưởng tính toán)
             disp_h = 700
             scale = disp_h / self.frame.shape[0]
             disp_w = int(self.frame.shape[1] * scale)
-            cv2.imshow("Result", cv2.resize(self.frame, (disp_w, disp_h)))
+            cv2.imshow("Result (Check Red Dot at Feet)", cv2.resize(self.frame, (disp_w, disp_h)))
             cv2.waitKey(0)
             cv2.destroyAllWindows()
         else:
