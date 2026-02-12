@@ -112,36 +112,27 @@ class YoloWorker:
             self.input_queue.put_nowait(frame)
 
     def get_results(self):
-        if not self.output_queue.empty():
-            return self.output_queue.get_nowait()
-        return None
+        return None if self.output_queue.empty() else self.output_queue.get_nowait()
 
     def run(self):
         while not self.stopped:
             try:
                 frame = self.input_queue.get(timeout=0.1)
-                
+
                 # --- ĐO YOLO LATENCY ---
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                
+
                 results = self.model(frame, verbose=False, device=self.device, conf=0.5, imgsz=640)
-                
+
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 self.profiler.update("YOLO_Infer", (t1 - t0) * 1000)
-                # -----------------------
-
-                # Đẩy kết quả ra queue (frame gốc đã xử lý xong)
-                # Chỉ cần gửi results object
-                if not self.output_queue.full():
-                    self.output_queue.put(results)
-                else:
+                if self.output_queue.full():
                     # Nếu main thread chưa kịp lấy kết quả cũ, vứt đi, lấy cái mới nhất
                     with contextlib.suppress(queue.Empty):
                         self.output_queue.get_nowait()
-                    self.output_queue.put(results)
-
+                self.output_queue.put(results)
             except queue.Empty:
                 continue
             except Exception as e:
