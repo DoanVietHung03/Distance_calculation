@@ -1,3 +1,4 @@
+import contextlib
 import cv2
 import numpy as np
 import math
@@ -11,10 +12,10 @@ from threading import Thread
 from height_estimator import HeightEstimator
 
 # ================= CẤU HÌNH =================
-VIDEO_PATH = '..\\test_imgs\\cam_2\\cam_2.mp4' 
+VIDEO_PATH = '..\\test_imgs\\cam_2\\cam_2.mp4'
 CALIB_FILE = '..\\calibration.json'
 CONFIG_FILE = 'config.json'
-TARGET_W = 1200 
+TARGET_W = 1200
 YOLO_SKIP_FRAMES = 5
 
 import time
@@ -121,40 +122,40 @@ class VideoDistanceApp:
         self.mode = "DISTANCE"
         self.paused = False
         self.frame_count = 0
-        
+
         # --- STABILIZER CONFIG ---
         self.lk_params = dict(winSize=(21, 21),
                               maxLevel=3,
                               criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-        
+
         # Biến lưu trữ "Mỏ neo" (Anchor)
         self.gray_anchor = None        # Ảnh xám của Frame Gốc (lúc bắt đầu tracking)
         self.p0_anchor = None          # Các điểm đặc trưng ở Frame Gốc
-        
+
         # --- ROI POINTS AND TARGET ---
         self.roi_points_initial = None # Tọa độ ROI gốc (cố định theo JSON)
         self.roi_points_curr = None    # Tọa độ ROI hiện tại (biến đổi theo M)
         # --- TARGET POINT ---
         self.target_point_initial = None
         self.target_point_curr = None
-        
+
         # --- ANTI-OCCLUSION DATA ---
         self.last_known_boxes = [] # Lưu vị trí người để né
-        
+
         self.target_tracker = None
 
         # Tools
         self.height_tool = HeightEstimator()
         self.yolo_model = None
-        
+
         # Data
         self.real_world = {}
         self.cam_real_pos = (0.5, -18.0)
         self.clicked_points_orig = []
         self.matrix_homography = None
-        self.scale_px_per_meter = 1.0 
+        self.scale_px_per_meter = 1.0
         self.map1, self.map2 = None, None
-        
+
         # Runtime
         self.current_frame = None
         self.detected_objects = []
@@ -165,10 +166,9 @@ class VideoDistanceApp:
         if torch.cuda.is_available():
             self.device = 0
             print(f"[INFO] GPU Activated: {torch.cuda.get_device_name(0)}")
-        
-        try:
-            self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx') 
-        except: pass
+
+        with contextlib.suppress(Exception):
+            self.yolo_model = YOLO('..\\weights\\yolo11n-pose.onnx')
 
     def init_calibration_maps(self, original_size):
         """
@@ -177,17 +177,17 @@ class VideoDistanceApp:
         if not os.path.exists(CALIB_FILE): return
         try:
             with open(CALIB_FILE, 'r') as f: data = json.load(f)
-            
+
             K = np.array(data['camera_matrix'])
             D = np.array(data['distortion_coefficients'])
-            
+
             w_orig, h_orig = original_size
-            
+
             # 1. Tính toán kích thước đích (Target Size)
             scale_factor = TARGET_W / w_orig
             target_h = int(h_orig * scale_factor)
             target_size = (TARGET_W, target_h) # Kích thước sau khi resize
-            
+
             # 2. Scale ma trận K cho phù hợp với kích thước đích
             # Lưu ý: K gốc thường đi kèm với độ phân giải khi calib. 
             # Nếu video gốc khác size calib, phải scale về video gốc trước, rồi scale tiếp về target.
@@ -196,7 +196,7 @@ class VideoDistanceApp:
                 # Scale từ Calib -> Video Gốc -> Target
                 total_scale_x = (w_orig / calib_w) * scale_factor
                 total_scale_y = (h_orig / calib_h) * scale_factor
-                
+
                 K[0, 0] *= total_scale_x
                 K[1, 1] *= total_scale_y
                 K[0, 2] *= total_scale_x
@@ -210,15 +210,14 @@ class VideoDistanceApp:
             # new_K cũng phải dựa trên target_size
             new_K, roi = cv2.getOptimalNewCameraMatrix(K, D, target_size, 1, target_size)
             self.map1, self.map2 = cv2.initUndistortRectifyMap(K, D, None, new_K, target_size, 5)
-            
+
             # Load focal length cũng phải theo scale này
             self.height_tool.load_focal_length(CALIB_FILE, TARGET_W)
-            
+
             print(f"[INFO] Optimized Maps created for size: {target_size}")
 
         except Exception as e:
             print(f"Error Init Calib: {e}")
-            pass
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE): return False
@@ -228,7 +227,7 @@ class VideoDistanceApp:
                 self.real_world = data['real_world']
                 self.cam_real_pos = (data['camera']['real_x'], data['camera']['real_y'])
                 self.scale_px_per_meter = data['settings'].get('scale_px_per_meter', 1.0)
-                
+
                 # 1. LOAD ROI POINTS
                 if 'points_px' in data:
                     self.clicked_points_orig = [tuple(p) for p in data['points_px']]
@@ -243,9 +242,10 @@ class VideoDistanceApp:
                     # Chuyển thành numpy array (1, 1, 2)
                     self.target_point_initial = np.array([[tp]], dtype=np.float32)
                     self.target_point_curr = self.target_point_initial.copy()
-                    
+
                 return True
-        except: return False
+        except Exception:
+            return False
 
     def get_quadrilateral_coords(self, l1, l2, l3, l4, d13):
         if l1 + l2 < d13 or abs(l1 - l2) > d13: return []
@@ -271,9 +271,8 @@ class VideoDistanceApp:
         if not real_coords: return
         dst_pts = np.float32([[pt[0]*self.scale_px_per_meter, pt[1]*self.scale_px_per_meter] for pt in real_coords])
         src_pts = current_pts_array.reshape(4, 2)
-        try:
+        with contextlib.suppress(Exception):
             self.matrix_homography = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        except: pass
 
     def calculate_distance_points(self, p1, p2):
         if self.matrix_homography is None: return 0.0
@@ -283,9 +282,6 @@ class VideoDistanceApp:
         return dist_px / self.scale_px_per_meter
 
     # ================= ANCHOR STABILIZER (OPTIMIZED) =================
-    
-    # Đã xóa hàm is_point_in_boxes để tối ưu hóa
-
     def init_anchor(self, gray_frame):
         """
         Khởi tạo Frame Gốc (Anchor). Mọi frame sau này sẽ được so sánh trực tiếp với Frame này.
@@ -414,11 +410,11 @@ class VideoDistanceApp:
             # --- PHASE 1: INFERENCE (Nặng nhất) ---
             # Nếu có class Profiler thì đo, không thì thôi (để code đỡ lỗi nếu chưa thêm)
             if hasattr(self, 'profiler'): self.profiler.start("YOLO")
-            
+
             # Chạy inference
             # verbose=False để đỡ spam console
             results = self.yolo_model(img, verbose=False, device=self.device, conf=0.5, imgsz=640)
-            
+
             if hasattr(self, 'profiler'): self.profiler.stop("YOLO")
 
             # --- PHASE 2: PROCESSING (Logic toán học) ---
@@ -427,13 +423,13 @@ class VideoDistanceApp:
             # Reset danh sách vật thể và hộp cấm (cho Stabilizer frame sau)
             self.detected_objects = []
             self.last_known_boxes = [] 
-            
+
             target_pt = self.get_current_target_tuple()
 
             for r in results:
                 # Lấy boxes và keypoints về CPU/Numpy
                 boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-                
+
                 # Check xem model có hỗ trợ Keypoints (Pose) không
                 kpts_data = None
                 if r.keypoints is not None and r.keypoints.data is not None:
@@ -442,9 +438,9 @@ class VideoDistanceApp:
                 for i, box in enumerate(boxes):
                     # 1. Lưu box để Stabilizer né (Anti-occlusion)
                     self.last_known_boxes.append(box)
-                    
+
                     x1, y1, x2, y2 = box
-                    
+
                     # 2. Xác định điểm ĐẦU và CHÂN
                     # Mặc định dùng Bounding Box (Top-Center và Bottom-Center)
                     head_point = (int((x1 + x2) / 2), y1)
@@ -453,7 +449,7 @@ class VideoDistanceApp:
                     # Nếu có Keypoints (Pose Model), dùng để chính xác hơn
                     if kpts_data is not None and len(kpts_data) > i:
                         kp = kpts_data[i] # Shape: (17, 3) -> [x, y, conf]
-                        
+
                         # -- Điểm CHÂN (Midpoint của 2 mắt cá chân: index 15, 16) --
                         # Kiểm tra độ tin cậy > 0.5
                         if kp[15][2] > 0.5 and kp[16][2] > 0.5:
@@ -464,7 +460,7 @@ class VideoDistanceApp:
                             ground_point = (int(kp[15][0]), int(kp[15][1]))
                         elif kp[16][2] > 0.5: # Chỉ thấy chân phải
                             ground_point = (int(kp[16][0]), int(kp[16][1]))
-                        
+
                         # -- Điểm ĐẦU (Mũi: index 0 hoặc Mắt: 1, 2) --
                         if kp[0][2] > 0.5: # Mũi
                             head_point = (int(kp[0][0]), int(kp[0][1]))
@@ -481,7 +477,7 @@ class VideoDistanceApp:
                         'h_real': 0.0, 
                         'd_to_target': 0.0
                     }
-                    
+
                     if self.mode == "HEIGHT":
                         # Gọi module tính chiều cao
                         h_real, _ = self.height_tool.calculate(
@@ -491,21 +487,15 @@ class VideoDistanceApp:
                             self.cam_real_pos
                         )
                         obj_info['h_real'] = h_real
-                        
+
                     elif self.mode == "DISTANCE" and target_pt:
                         # Gọi hàm tính khoảng cách tới điểm target
                         d_target = self.calculate_distance_points(ground_point, target_pt)
                         obj_info['d_to_target'] = d_target
-                    
+
                     self.detected_objects.append(obj_info)
 
             if hasattr(self, 'profiler'): self.profiler.stop("Math_Logic")
-            
-        else:
-            # OPTIONAL: Nếu đang SKIP frame, bạn có thể giữ nguyên logic cũ 
-            # hoặc update vị trí các vật thể cũ bằng Optical Flow (nâng cao).
-            # Ở mức cơ bản, ta chỉ pass để giữ nguyên self.detected_objects của frame trước.
-            pass
 
     def process_frame(self, raw_frame):
         self.profiler.start("Total")
@@ -592,19 +582,16 @@ class VideoDistanceApp:
 app = VideoDistanceApp()
 
 def mouse_event_video(event, x, y, flags, param):
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if app.mode == "DISTANCE":
-            # Nếu click chuột, ta cập nhật thủ công vào biến curr
-            app.target_point_curr = np.array([[[x, y]]], dtype=np.float32)
-            
-            # Cố gắng reset tracker KCF để track theo điểm mới (dù Anchor Stabilizer vẫn đang chạy ngầm)
-            box_size = 20
-            bbox = (max(0, x - box_size//2), max(0, y - box_size//2), box_size, box_size)
-            try:
-                app.target_tracker = cv2.TrackerKCF_create() 
-                app.target_tracker.init(app.current_frame, bbox)
-                print(f"[TARGET] Mouse Click override: {bbox}")
-            except: pass
+    if event == cv2.EVENT_LBUTTONDOWN and app.mode == "DISTANCE":
+        app.target_point_curr = np.array([[[x, y]]], dtype=np.float32)
+
+        # Cố gắng reset tracker KCF để track theo điểm mới (dù Anchor Stabilizer vẫn đang chạy ngầm)
+        box_size = 20
+        bbox = (max(0, x - box_size//2), max(0, y - box_size//2), box_size, box_size)
+        with contextlib.suppress(Exception):
+            app.target_tracker = cv2.TrackerKCF_create()
+            app.target_tracker.init(app.current_frame, bbox)
+            print(f"[TARGET] Mouse Click override: {bbox}")
 
 def main():
     vs = VideoStream(VIDEO_PATH).start()
