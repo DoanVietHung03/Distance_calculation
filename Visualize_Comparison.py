@@ -8,10 +8,10 @@ data = {
     'Real_Distance': [1.44, 2.79, 2.65, 2.6],
     
     # Kết quả đo từ phương pháp Hybrid (Homography)
-    'Hybrid_Dist':   [2.95, 5.10, 7.20, 10.50], 
+    'Hybrid_Dist':   [1.58, 2.49, 2.39, 3.2], 
     
     # Kết quả đo từ phương pháp Deep Learning (Depth Anything)
-    'DL_Dist':       [2.80, 4.90, 6.80, 9.50]
+    'DL_Dist':       [0.88, 2.9, 3.01, 2.5]
 }
 # ================================================================
 
