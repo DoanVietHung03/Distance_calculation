@@ -1,11 +1,12 @@
 from ultralytics import YOLO
 
-# 1. Load model PyTorch gốc
-model = YOLO('.\\weights\\yolo11n-pose.pt')
+# Load model gốc (ví dụ đuôi .pt)
+model = YOLO(".\\weights\\yolo11n-pose.pt") 
 
-# 2. Export sang ONNX
-# format='onnx': Định dạng xuất
-# half=True: Sử dụng FP16 (giúp tăng FPS đáng kể trên GPU)
-# dynamic=True: Cho phép kích thước ảnh đầu vào linh hoạt (nếu cần)
-# imgsz=640: Cố định kích thước ảnh đầu vào (tối ưu tốc độ hơn dynamic)
-model.export(format='onnx', half=True, imgsz=640)
+# Export với các tham số tương thích tuyệt đối với OpenCV
+model.export(
+    format="onnx", 
+    opset=12,           # Ép dùng bộ phép toán cũ, ổn định cho OpenCV
+    simplify=True,      # Gộp các phép toán thừa, cố định kích thước input
+    dynamic=False       # Tắt tính năng kích thước ảnh tự do
+)
